@@ -2,3 +2,8 @@
 __pycache__/
 .vscode/
 app_data/
+old/
+appdata/
+api-vault.exe
+config.yml
+dist/

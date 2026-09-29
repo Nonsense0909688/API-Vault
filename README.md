@@ -1,47 +1,87 @@
-# API Vault
+# API-Vault
 
-_**"A secure, self-hosted way to save, view, and use your API."**_
+*"A secure, self-hosted way to save, view, and use your API secrets."*
 
-## Why ?
+## Why?
 
-Secrets doesn't always get leaked by hackers. A developer can accidently commit the `.env` file, push creds to Github or save keys as plain text. As a team grows it becomes harder to manage secrets and keys. 
+Secrets don't always get leaked by hackers.
 
-API Vault provides a central place where all keys can be saved securely. And developers can simply request for keys or secrets just like they do os.getenv("<key>"). Plus have an GUI interface to easily manage keys they have.
+A developer can accidentally commit a `.env` file, push credentials to GitHub, or store API keys as plain text. As a project grows, managing secrets securely can become increasingly difficult.
 
-## How ?
+**API-Vault** provides a self-hosted central place to securely store and manage API keys, tokens, passwords, and other secrets.
 
-API-vault encrypts your api-keys using the machine data. So that it can only be unlocked on the same machine. **Fernet (AES-128) based encryption**
+## Features
 
-It uses temp-tokens for authentication
-which change every day. **JWT Based authentication.**
+* AES-256-GCM encrypted secret storage
+* Self-hosted
+* Web dashboard
+* REST API
+* Python SDK
+* JavaScript SDK
+* Session-based authentication
+* Automatic session expiration
+* Create, view, update, and delete secrets
+* Configurable server and authentication settings
+* Local storage
+* Lightweight deployment
 
+## How?
 
-## Features:-
+API-Vault encrypts stored secret values using **AES-256-GCM** encryption.
 
-- JWT-based sessions
-- Simple **web** dashboard
-- REST API
-- Fernet (AES-128) encrypted api-keys
+Each installation generates a random **32-byte encryption key** which is stored locally and reused across restarts.
 
-## Project Structure
-
+```text
+Secret
+   │
+   ▼
+AES-256-GCM
+   │
+   ▼
+Encrypted Value
+   │
+   ▼
+secrets.json
 ```
-api-vault/
-├── api/
-├── core/
-├── database/
-├── middleware/
-├── static/
-├── templates/
-└── app.py
+
+## Architecture
+
+```text
+Client
+  │
+  ├── Web Dashboard
+  ├── REST API
+  ├── Python SDK
+  └── JavaScript SDK
+          │
+          ▼
+      API-Vault
+          │
+          ▼
+   AES-256-GCM Encryption
+          │
+          ▼
+      Local Storage
 ```
 
-## Project Images
+## Installation
 
-![Image of the Dashboard](images/image1.png)
+```bash
+pip install api-vault-sdk
+```
 
-![Image of the Dashboard](images/image2.png)
+## Self-Hosting
 
-## Contribution
+API-Vault is designed to run on your own machine or server, giving you control over where your secrets are stored and how the service is accessed.
 
-Pull requests and suggestions are welcome. If you'd like to contribute, feel free to open an issue or submit a pull request.
+## Security
+
+API-Vault uses:
+
+* AES-256-GCM for secret encryption
+* Random 32-byte encryption keys
+* Session-based authentication
+* Configurable session expiration
+* Local encrypted secret storage
+
+> API-Vault is intended to provide secure secret management, but proper server security, access control, backups, and network configuration are still the responsibility of the operator.

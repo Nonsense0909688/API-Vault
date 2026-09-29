@@ -388,9 +388,6 @@
                 <label>Name</label>
                 <input id="add_name" type="text" placeholder="OpenAI">
 
-                <label>Website</label>
-                <input id="add_site" type="text" placeholder="https://platform.openai.com">
-
                 <label>API Key</label>
                 <input id="add_key" type="password" placeholder="sk-...">
 
@@ -406,12 +403,11 @@
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         const add_name = document.getElementById("add_name");
-        const add_site = document.getElementById("add_site");
         const add_key = document.getElementById("add_key");
 
         async function logout() {
 
-            const req = await fetch("/api/v1/sessions/logout", {
+            const req = await fetch("/logout", {
                 method: "POST"
             });
 
@@ -424,15 +420,14 @@
         }
 
         async function addAPI() {
-            const req = await fetch("/api/v1/add_key", {
+            const req = await fetch("/save_secrets", {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json"
                 },
                 body: JSON.stringify({
-                    name: add_name.value,
-                    website: add_site.value,
-                    api_key: add_key.value
+                    key: add_name.value,
+                    value: add_key.value
                 })
             });
 
@@ -454,13 +449,13 @@
 
         async function deleteAPI(value) {
 
-            const req = await fetch("/api/v1/delete_key", {
+            const req = await fetch("/remove_secrets", {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json"
                 },
                 body: JSON.stringify({
-                    name: value
+                    key: value
                 })
             });
 
@@ -472,7 +467,15 @@
 
         async function loadKeys() {
 
-            const req = await fetch("/api/v1/list_keys");
+            const req = await fetch("/view_secrets", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    key: "Testing"
+                })
+            });
 
             const data = await req.json();
 
@@ -487,14 +490,14 @@
                         <i class="bi bi-key-fill card-icon"></i>
 
                         <div class="data">
-                            <span class="label">${key.name}</span>
+                            <span class="label">${key.key}</span>
 
                             <div class="api">
-                                <input class="api-key" type="password" disabled value="${key.api_key}">
+                                <input class="api-key" type="password" disabled value="${key.value}">
                                 <i class="bi bi-eye-slash look"></i>
                                 <i class="bi bi-clipboard copy"
-                                onclick="copyToClipboard('${key.api_key}', this)"></i>
-                                <i class="bi bi-x-lg delete" onclick="deleteAPI('${key.name}')"></i>
+                                onclick="copyToClipboard('${key.value}', this)"></i>
+                                <i class="bi bi-x-lg delete" onclick="deleteAPI('${key.key}')"></i>
                             </div>
 
                         </div>

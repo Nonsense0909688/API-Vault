@@ -1,0 +1,13 @@
+{
+    "name": "@api-vault/sdk",
+    "version": "1.0.0",
+    "description": "JavaScript SDK for API-Vault",
+    "main": "src/index.js",
+    "keywords": [
+        "api-vault",
+        "secrets",
+        "vault",
+        "security"
+    ],
+    "license": "MIT"
+}

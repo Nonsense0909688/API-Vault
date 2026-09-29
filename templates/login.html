@@ -157,7 +157,55 @@
         </div>
 
     </div>
-    <script src="/static/script.js"></script>
+    <script>
+        const password = document.getElementById("password");
+const sig = document.getElementById("signal");
+
+function success() {
+  window.location.href = "/dashboard";
+}
+
+function fail() {
+  password.style.borderColor = "var(--danger)";
+  password.style.boxShadow = "0 0 0 .2rem rgba(239,68,68,.15)";
+  sig.innerText = res.message || "Invalid password.";
+
+  setTimeout(() => {
+    sig.innerText = "";
+    pass.style.borderColor = "";
+    pass.style.boxShadow = "";
+  }, 700);
+}
+
+async function login(event) {
+  event.preventDefault();
+
+  const req = await fetch("/login/post", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      key: password.value,
+    }),
+  });
+
+  if (req.redirected) {
+    window.location.href = req.url;
+    return;
+  }
+
+  const text = await req.text();
+
+  if (!req.ok) {
+    fail();
+    return;
+  }
+
+  success();
+}
+
+    </script>
 </body>
 
 </html>

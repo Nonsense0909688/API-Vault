@@ -1,0 +1,11 @@
+# config.example.yml
+
+app-settings:
+  port: 3000
+  address: 127.0.0.1
+
+auth:
+  password: "CHANGE_ME"
+
+session:
+  duration: 24h
