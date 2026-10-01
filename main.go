@@ -34,6 +34,8 @@ func main() {
 		log.Fatal(err)
 	}
 
+	initStorage()
+
 	if err := loadEncryptionKey(); err != nil {
 		log.Fatal(err)
 	}
@@ -51,6 +53,7 @@ func main() {
 		"[STORAGE] Loaded %d secrets",
 		len(secrets),
 	)
+
 
 	// Load sessions
 	var err error
@@ -71,7 +74,8 @@ func main() {
 	)
 
 	// Routes
-	http.HandleFunc("/", handleRoot)
+	registerPages()
+	registerAPIs()
 
 	http.HandleFunc(
 		"/save_secrets",
@@ -86,11 +90,6 @@ func main() {
 	http.HandleFunc(
 		"/remove_secrets",
 		handleDeleteSecret,
-	)
-
-	http.HandleFunc(
-		"/login",
-		handleLogin,
 	)
 
 	http.HandleFunc(

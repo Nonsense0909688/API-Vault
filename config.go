@@ -3,9 +3,10 @@ package main
 import (
 	"fmt"
 	"os"
-
+	"path/filepath" 
 	"golang.org/x/sys/windows"
 	"gopkg.in/yaml.v3"
+	"log"
 )
 
 func showError(err error) {
@@ -26,7 +27,11 @@ func loadConfig() error {
   address: 127.0.0.1
 
 auth:
-  password: "CHANGE_ME"
+  admin_username: "Admin"
+  admin_password: "Admin"
+  
+storage:
+  appfolder: "appdata"
 
 session:
   duration: 24h
@@ -47,4 +52,19 @@ session:
 	}
 
 	return nil
+}
+
+func initStorage() {
+	if appfolder == "" {
+		appfolder = "appdata"
+	}
+
+	if err := os.MkdirAll(appfolder, 0755); err != nil {
+		log.Fatal(err)
+	}
+
+	usersFile = filepath.Join(appfolder, "users.json")
+	permissionsFile = filepath.Join(appfolder, "permissions.json")
+	sessions_file = filepath.Join(appfolder, "sessions.json")
+	secrets_file = filepath.Join(appfolder, "secrets.json")
 }

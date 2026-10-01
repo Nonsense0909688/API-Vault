@@ -3,81 +3,78 @@ package main
 import (
 	"encoding/json"
 	"os"
-	"time"
 )
 
-var sessions_file = "appdata/sessions.json"
-var secrets_file = "appdata/secrets.json"
-
-// Session Cookies storage system
-
-func saveSessions(sessions map[string]time.Time) error {
-	data, err := json.MarshalIndent(sessions, "", "    ")
-	if err != nil {
-		return err
-	}
-
-	if err := os.MkdirAll("appdata", 0700); err != nil {
-		return err
-	}
-
-	return os.WriteFile(sessions_file, data, 0600)
-}
-
-func loadSessions() (map[string]time.Time, error) {
+func loadSessions() (map[string]Session, error) {
 	data, err := os.ReadFile(sessions_file)
-
+	if os.IsNotExist(err) {
+		return map[string]Session{}, nil
+	}
 	if err != nil {
-		if os.IsNotExist(err) {
-			return make(map[string]time.Time), nil
-		}
-
 		return nil, err
 	}
 
-	var sessions map[string]time.Time
-
-	if err := json.Unmarshal(data, &sessions); err != nil {
-		return nil, err
-	}
-
+	var sessions map[string]Session
+	err = json.Unmarshal(data, &sessions)
 	if sessions == nil {
-		sessions = make(map[string]time.Time)
+		sessions = map[string]Session{}
 	}
-
-	return sessions, nil
+	return sessions, err
 }
 
-// API Secrets Storage System
-
-func saveSecrets(secrets []Secret) error {
-	data, err := json.MarshalIndent(secrets, "", "    ")
+func saveSessions(s map[string]Session) error {
+	if err := ensureData(); err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
-
-	if err := os.MkdirAll("appdata", 0700); err != nil {
-		return err
-	}
-
-	return os.WriteFile(secrets_file, data, 0600)
+	return os.WriteFile(sessions_file, b, 0600)
 }
 
 func loadSecrets() error {
 	data, err := os.ReadFile(secrets_file)
-
+	if os.IsNotExist(err) {
+		secrets = []Secret{}
+		return nil
+	}
 	if err != nil {
-		if os.IsNotExist(err) {
-			secrets = []Secret{}
-			return nil
-		}
+		return err
+	}
+	return json.Unmarshal(data, &secrets)
+}
 
+func saveSecrets(s []Secret) error {
+	return saveJSON(secrets_file, s)
+}
+
+func loadJSON[T any](file string) ([]T, error) {
+	if err := ensureData(); err != nil {
+		return nil, err
+	}
+
+	data, err := os.ReadFile(file)
+	if os.IsNotExist(err) || len(data) == 0 {
+		return []T{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var result []T
+	return result, json.Unmarshal(data, &result)
+}
+
+func saveJSON[T any](file string, data []T) error {
+	if err := ensureData(); err != nil {
 		return err
 	}
 
-	if err := json.Unmarshal(data, &secrets); err != nil {
+	b, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
 		return err
 	}
 
-	return nil
+	return os.WriteFile(file, b, 0600)
 }

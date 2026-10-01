@@ -1,6 +1,6 @@
 # API-Vault
 
-*"A secure, self-hosted way to save, view, and use your API secrets."*
+_"A secure, self-hosted way to save, view, and use your API secrets."_
 
 ## Why?
 
@@ -12,18 +12,19 @@ A developer can accidentally commit a `.env` file, push credentials to GitHub, o
 
 ## Features
 
-* AES-256-GCM encrypted secret storage
-* Self-hosted
-* Web dashboard
-* REST API
-* Python SDK
-* JavaScript SDK
-* Session-based authentication
-* Automatic session expiration
-* Create, view, update, and delete secrets
-* Configurable server and authentication settings
-* Local storage
-* Lightweight deployment
+- AES-256-GCM encrypted secret storage
+- Self-hosted
+- Web dashboard
+- REST API
+- Python SDK
+- JavaScript SDK
+- Session-based authentication
+- Automatic session expiration
+- Create, view, update, and delete secrets
+- Configurable server and authentication settings
+- Local storage
+- Lightweight deployment
+- 12.6 MB(s) executable
 
 ## How?
 
@@ -51,8 +52,7 @@ Client
   │
   ├── Web Dashboard
   ├── REST API
-  ├── Python SDK
-  └── JavaScript SDK
+  └── Python SDK
           │
           ▼
       API-Vault
@@ -78,10 +78,18 @@ API-Vault is designed to run on your own machine or server, giving you control o
 
 API-Vault uses:
 
-* AES-256-GCM for secret encryption
-* Random 32-byte encryption keys
-* Session-based authentication
-* Configurable session expiration
-* Local encrypted secret storage
+- AES-256-GCM for secret encryption
+- Random 32-byte encryption keys
+- Session-based authentication
+- Configurable session expiration
+- Local encrypted secret storage
 
 > API-Vault is intended to provide secure secret management, but proper server security, access control, backups, and network configuration are still the responsibility of the operator.
+
+## Visuals
+
+![Image description](<images/new/Screenshot%20(497).png>)
+![Image description](<images/new/Screenshot%20(498).png>)
+![Image description](<images/new/Screenshot (499).png>)
+![Image description](<images/new/Screenshot (500).png>)
+![Image description](<images/new/Screenshot (501).png>)
