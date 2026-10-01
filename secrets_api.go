@@ -7,14 +7,12 @@ import (
 	"net/http"
 )
 
-// Handles saving new API keys
+// Handles saving new API keys.
 
 func handleSaveSecretKey(w http.ResponseWriter, r *http.Request) {
 
-	userID, ok := getSessionUserID(r)
-
+	user, ok := requireUser(w, r)
 	if !ok {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -35,6 +33,13 @@ func handleSaveSecretKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Saving under a key someone else owns silently replaced their secret.
+	if !canAdministerSecret(user, data.Key) {
+		logEvent("ACCESS_DENIED", "User "+user.Username+" tried to overwrite "+data.Key)
+		http.Error(w, "A secret with that name belongs to another user", http.StatusForbidden)
+		return
+	}
+
 	encryptedValue, err := encrypt(
 		encryptionKey,
 		data.Value,
@@ -52,23 +57,26 @@ func handleSaveSecretKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data.Value = hex.EncodeToString(encryptedValue)
-	data.CreatedBy = userID
+	data.CreatedBy = user.ID
+
+	secretsMu.Lock()
+	defer secretsMu.Unlock()
 
 	// Override existing secret
 	for i := range secrets {
 
 		if secrets[i].Key == data.Key {
 
-			secrets[i].Value = data.Value
-
 			// Keep original creator
 			if secrets[i].CreatedBy != "" {
 				data.CreatedBy = secrets[i].CreatedBy
 			}
 
+			previous := secrets[i]
 			secrets[i] = data
 
-			if err := saveSecrets(secrets); err != nil {
+			if err := saveSecretsLocked(); err != nil {
+				secrets[i] = previous
 				http.Error(w, "Failed to save secret", 500)
 				return
 			}
@@ -84,7 +92,8 @@ func handleSaveSecretKey(w http.ResponseWriter, r *http.Request) {
 	// Create new secret
 	secrets = append(secrets, data)
 
-	if err := saveSecrets(secrets); err != nil {
+	if err := saveSecretsLocked(); err != nil {
+		secrets = secrets[:len(secrets)-1]
 		http.Error(w, "Failed to save secret", 500)
 		return
 	}
@@ -94,87 +103,13 @@ func handleSaveSecretKey(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Handles viewing API Keys between usernames so that one cannot see the other's api key
+// Handles viewing API keys so that one user cannot see another's.
 // The admin can see all the api keys and modify them.
 
 func handleViewSecrets(w http.ResponseWriter, r *http.Request) {
 
-	userID, ok := getSessionUserID(r)
-
+	currentUser, ok := requireUser(w, r)
 	if !ok {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	// Load users
-	users, err := loadJSON[APIUser](usersFile)
-
-	if err != nil {
-		log.Printf("[ERROR] Failed to load users: %v", err)
-		http.Error(w, "Failed to load users", 500)
-		return
-	}
-
-	// Find current user
-	var currentUser *APIUser
-
-	for i := range users {
-		if users[i].ID == userID {
-			currentUser = &users[i]
-			break
-		}
-	}
-
-	if currentUser == nil {
-		http.Error(w, "User not found", http.StatusUnauthorized)
-		return
-	}
-
-	// ================= ADMIN =================
-	// Admin can see EVERYTHING.
-	if currentUser.Role == "admin" {
-
-		var result []Secret
-
-		for _, secret := range secrets {
-
-			encryptedValue, err := hex.DecodeString(secret.Value)
-
-			if err != nil {
-				log.Printf(
-					"[ERROR] Failed to decode secret '%s': %v",
-					secret.Key,
-					err,
-				)
-
-				http.Error(w, "Failed to decode secret", 500)
-				return
-			}
-
-			decryptedValue, err := decrypt(
-				encryptionKey,
-				encryptedValue,
-			)
-
-			if err != nil {
-				log.Printf(
-					"[ERROR] Failed to decrypt secret '%s': %v",
-					secret.Key,
-					err,
-				)
-
-				http.Error(w, "Failed to decrypt secret", 500)
-				return
-			}
-
-			result = append(result, Secret{
-				Key:       secret.Key,
-				Value:     decryptedValue,
-				CreatedBy: secret.CreatedBy,
-			})
-		}
-
-		jsonOut(w, result)
 		return
 	}
 
@@ -195,24 +130,27 @@ func handleViewSecrets(w http.ResponseWriter, r *http.Request) {
 
 		for _, id := range permission.UserIDs {
 
-			if id == userID {
+			if id == currentUser.ID {
 				allowed[permission.Key] = true
 				break
 			}
 		}
 	}
 
-	var result []Secret
+	admin := isAdmin(currentUser)
+
+	secretsMu.RLock()
+	defer secretsMu.RUnlock()
+
+	result := make([]Secret, 0, len(secrets))
 
 	for _, secret := range secrets {
 
-		// User can see:
+		// A user can see:
 		// 1. Their own secrets
 		// 2. Secrets explicitly shared with them
-
-		canView := secret.CreatedBy == userID || allowed[secret.Key]
-
-		if !canView {
+		// An admin sees everything.
+		if !admin && secret.CreatedBy != currentUser.ID && !allowed[secret.Key] {
 			continue
 		}
 
@@ -255,12 +193,12 @@ func handleViewSecrets(w http.ResponseWriter, r *http.Request) {
 	jsonOut(w, result)
 }
 
-// Handles deleting the api keys
+// Handles deleting the api keys.
 
 func handleDeleteSecret(w http.ResponseWriter, r *http.Request) {
 
-	if !isAuthenticated(r) {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	user, ok := requireUser(w, r)
+	if !ok {
 		return
 	}
 
@@ -273,33 +211,96 @@ func handleDeleteSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	for i, secret := range secrets {
-
-		if secret.Key != data.Key {
-			continue
-		}
-
-		secrets = append(
-			secrets[:i],
-			secrets[i+1:]...,
-		)
-
-		if err := saveSecrets(secrets); err != nil {
-			http.Error(w, "Failed to save secrets", 500)
-			return
-		}
-
-		jsonOut(w, map[string]string{
-			"status": "deleted",
-		})
-
+	if data.Key == "" {
+		http.Error(w, "Secret key is required", http.StatusBadRequest)
 		return
 	}
 
-	http.Error(w, "Secret not found", http.StatusNotFound)
+	if _, exists := secretOwner(data.Key); !exists {
+		http.Error(w, "Secret not found", http.StatusNotFound)
+		return
+	}
+
+	// Deletion only checked that the caller was logged in, so any account
+	// could wipe any other account's secrets.
+	if !canAdministerSecret(user, data.Key) {
+		logEvent("ACCESS_DENIED", "User "+user.Username+" tried to delete "+data.Key)
+		http.Error(w, "Not allowed to delete this secret", http.StatusForbidden)
+		return
+	}
+
+	secretsMu.Lock()
+
+	removed := false
+	remaining := make([]Secret, 0, len(secrets))
+
+	for _, secret := range secrets {
+		if secret.Key == data.Key {
+			removed = true
+			continue
+		}
+
+		remaining = append(remaining, secret)
+	}
+
+	if !removed {
+		secretsMu.Unlock()
+		http.Error(w, "Secret not found", http.StatusNotFound)
+		return
+	}
+
+	previous := secrets
+	secrets = remaining
+
+	if err := saveSecretsLocked(); err != nil {
+		secrets = previous
+		secretsMu.Unlock()
+		http.Error(w, "Failed to save secrets", 500)
+		return
+	}
+
+	secretsMu.Unlock()
+
+	// Drop the sharing entry too, so a later secret reusing the name does not
+	// inherit the old grants.
+	if err := removePermission(data.Key); err != nil {
+		log.Printf("[ERROR] Failed to clear permissions for '%s': %v", data.Key, err)
+	}
+
+	jsonOut(w, map[string]string{
+		"status": "deleted",
+	})
 }
 
-// Switching between Saving, deleting, viewing keys
+func removePermission(key string) error {
+	permissionsMu.Lock()
+	defer permissionsMu.Unlock()
+
+	permissions, err := loadJSON[Permission](permissionsFile)
+	if err != nil {
+		return err
+	}
+
+	remaining := make([]Permission, 0, len(permissions))
+	changed := false
+
+	for _, permission := range permissions {
+		if permission.Key == key {
+			changed = true
+			continue
+		}
+
+		remaining = append(remaining, permission)
+	}
+
+	if !changed {
+		return nil
+	}
+
+	return saveJSON(permissionsFile, remaining)
+}
+
+// Switching between saving, deleting and viewing keys.
 
 func handleAPISecrets(w http.ResponseWriter, r *http.Request) {
 

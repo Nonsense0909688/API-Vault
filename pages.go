@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"net/http"
 )
@@ -9,13 +8,17 @@ import (
 func handleLoginPage(w http.ResponseWriter, r *http.Request) {
 	logEvent("LOGIN_PAGE", "Login page requested")
 
-	if err := templates.ExecuteTemplate(w, "login.html", nil); err != nil {
-		log.Printf("[ERROR] Failed to execute login template: %v", err)
-		http.Error(w, "Template error", http.StatusInternalServerError)
-	}
+	render(w, "login.html", nil)
 }
 
 func handleDashboardPage(w http.ResponseWriter, r *http.Request) {
+	// "/" is the catch-all pattern, so without this every unknown path
+	// rendered the dashboard instead of a 404.
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+
 	if !isAuthenticated(r) {
 		logEvent("AUTH_FAILED", "Unauthorized access to dashboard")
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
@@ -24,52 +27,14 @@ func handleDashboardPage(w http.ResponseWriter, r *http.Request) {
 
 	logEvent("DASHBOARD", "Dashboard accessed")
 
-	if err := templates.ExecuteTemplate(w, "dashboard.html", nil); err != nil {
-		log.Printf("[ERROR] Failed to execute index template: %v", err)
-		http.Error(w, "Template error", http.StatusInternalServerError)
-	}
+	render(w, "dashboard.html", nil)
 }
 
-func getSession(r *http.Request) (*Session, *APIUser, error) {
-	cookie, err := r.Cookie("session")
-	if err != nil {
-		return nil, nil, err
-	}
-
-	sessions, err := loadSessions()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	session, exists := sessions[cookie.Value]
-	if !exists {
-		return nil, nil, fmt.Errorf("session not found")
-	}
-
-	users, err := loadJSON[APIUser](usersFile)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	for i := range users {
-		if users[i].ID == session.UserID {
-			return &session, &users[i], nil
-		}
-	}
-
-	return nil, nil, fmt.Errorf("user not found")
-}
 func handlekeysPage(w http.ResponseWriter, r *http.Request) {
-	if !isAuthenticated(r) {
+	user, ok := currentUser(r)
+	if !ok {
 		logEvent("AUTH_FAILED", "Unauthorized access to keys")
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
-		return
-	}
-
-	_, user, err := getSession(r)
-	if err != nil {
-		log.Printf("[ERROR] Failed to get session user: %v", err)
-		http.Error(w, "Session error", http.StatusInternalServerError)
 		return
 	}
 
@@ -79,42 +44,41 @@ func handlekeysPage(w http.ResponseWriter, r *http.Request) {
 		Username: user.Username,
 	}
 
-	if err := templates.ExecuteTemplate(w, "keys.html", data); err != nil {
-		log.Printf("[ERROR] Failed to execute keys template: %v", err)
-		http.Error(w, "Template error", http.StatusInternalServerError)
-	}
-}
-
-func handleHistroyPage(w http.ResponseWriter, r *http.Request) {
-	if !isAuthenticated(r) {
-		logEvent("AUTH_FAILED", "Unauthorized access to dashboard")
-		http.Redirect(w, r, "/login", http.StatusSeeOther)
-		return
-	}
-
-	if err := templates.ExecuteTemplate(w, "history.html", nil); err != nil {
-		log.Printf("[ERROR] Failed to execute index template: %v", err)
-		http.Error(w, "Template error", http.StatusInternalServerError)
-	}
+	render(w, "keys.html", data)
 }
 
 func handleUserManagmentPage(w http.ResponseWriter, r *http.Request) {
-	if !isAuthenticated(r) {
-		logEvent("AUTH_FAILED", "Unauthorized access to dashboard")
+	user, ok := currentUser(r)
+	if !ok {
+		logEvent("AUTH_FAILED", "Unauthorized access to user management")
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
 
-	if err := templates.ExecuteTemplate(w, "user_management.html", nil); err != nil {
-		log.Printf("[ERROR] Failed to execute index template: %v", err)
+	// The page drives the admin-only user endpoints, so it should not be
+	// reachable by a regular account.
+	if !isAdmin(user) {
+		logEvent("ACCESS_DENIED", "Non-admin opened user management: "+user.Username)
+		http.Error(w, "Admin access required", http.StatusForbidden)
+		return
+	}
+
+	render(w, "user_management.html", nil)
+}
+
+func render(w http.ResponseWriter, name string, data any) {
+	if err := templates.ExecuteTemplate(w, name, data); err != nil {
+		log.Printf("[ERROR] Failed to execute %s: %v", name, err)
 		http.Error(w, "Template error", http.StatusInternalServerError)
 	}
 }
 
-func registerPages() {
-	http.HandleFunc("/", handleDashboardPage)
-	http.HandleFunc("/login", handleLoginPage)
-	http.HandleFunc("/keys", handlekeysPage)
-	http.HandleFunc("/user-management", handleUserManagmentPage)
-	http.HandleFunc("/history", handleHistroyPage)
+func registerPages(mux *http.ServeMux) {
+	mux.HandleFunc("/", handleDashboardPage)
+	mux.HandleFunc("/login", handleLoginPage)
+	mux.HandleFunc("/keys", handlekeysPage)
+	mux.HandleFunc("/user-management", handleUserManagmentPage)
+
+	// "/history" was registered but templates/history.html does not exist,
+	// so the route always returned a 500. Removed until the page is built.
 }

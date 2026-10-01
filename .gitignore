@@ -5,6 +5,8 @@ app_data/
 old/
 appdata/
 api-vault.exe
+api-vault
+output/
 config.yml
 dist/
 data/

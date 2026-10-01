@@ -1,11 +1,27 @@
 # config.example.yml
+#
+# API-Vault writes a config.yml itself on first start, with a generated admin
+# password. This file documents the available settings.
 
 app-settings:
   port: 3000
   address: 127.0.0.1
 
 auth:
-  password: "CHANGE_ME"
+  admin_username: "Admin"
+  # The key is admin_password, not password. Used once, to create the admin
+  # account on first start.
+  admin_password: "CHANGE_ME"
+
+storage:
+  appfolder: "appdata"
+  # Where to keep the AES key. Empty means <appfolder>/encryption.key, which
+  # stores it beside the secrets it protects. Set a path outside the data
+  # directory, or use API_VAULT_ENCRYPTION_KEY, to separate the two.
+  key_file: ""
 
 session:
   duration: 24h
+  # Send the session cookie only over HTTPS. Turn this on whenever the vault
+  # is reachable over TLS, including behind a TLS-terminating proxy.
+  secure_cookies: false
