@@ -59,7 +59,7 @@ func handleUserManagmentPage(w http.ResponseWriter, r *http.Request) {
 	// reachable by a regular account.
 	if !isAdmin(user) {
 		logEvent("ACCESS_DENIED", "Non-admin opened user management: "+user.Username)
-		http.Error(w, "Admin access required", http.StatusForbidden)
+		http.Redirect(w, r, "/?error=admin_required", http.StatusSeeOther)
 		return
 	}
 

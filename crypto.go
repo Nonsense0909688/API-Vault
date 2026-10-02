@@ -13,34 +13,33 @@ import (
 	"strings"
 )
 
-// Environment variable holding a hex-encoded 32-byte key. Set it to keep the
-// key off the same disk as the vault.
 const encryptionKeyEnv = "API_VAULT_ENCRYPTION_KEY"
 
+// encrypt encrypts plaintext using AES-256-GCM.
+//
+// The returned ciphertext contains the nonce followed by the encrypted data.
 func encrypt(key []byte, plaintext string) ([]byte, error) {
+	if len(key) != 32 {
+		return nil, fmt.Errorf(
+			"invalid encryption key size: got %d bytes, expected 32",
+			len(key),
+		)
+	}
 
 	block, err := aes.NewCipher(key)
-
 	if err != nil {
 		return nil, err
 	}
 
 	gcm, err := cipher.NewGCM(block)
-
 	if err != nil {
 		return nil, err
 	}
 
-	nonce := make(
-		[]byte,
-		gcm.NonceSize(),
-	)
+	nonce := make([]byte, gcm.NonceSize())
 
-	if _, err := io.ReadFull(
-		rand.Reader,
-		nonce,
-	); err != nil {
-		return nil, err
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, fmt.Errorf("failed to generate nonce: %w", err)
 	}
 
 	ciphertext := gcm.Seal(
@@ -53,16 +52,23 @@ func encrypt(key []byte, plaintext string) ([]byte, error) {
 	return ciphertext, nil
 }
 
+// decrypt decrypts AES-256-GCM ciphertext.
+//
+// The ciphertext must contain the nonce followed by the encrypted data.
 func decrypt(key []byte, ciphertext []byte) (string, error) {
+	if len(key) != 32 {
+		return "", fmt.Errorf(
+			"invalid encryption key size: got %d bytes, expected 32",
+			len(key),
+		)
+	}
 
 	block, err := aes.NewCipher(key)
-
 	if err != nil {
 		return "", err
 	}
 
 	gcm, err := cipher.NewGCM(block)
-
 	if err != nil {
 		return "", err
 	}
@@ -70,9 +76,7 @@ func decrypt(key []byte, ciphertext []byte) (string, error) {
 	nonceSize := gcm.NonceSize()
 
 	if len(ciphertext) < nonceSize {
-		return "", fmt.Errorf(
-			"ciphertext too short",
-		)
+		return "", fmt.Errorf("ciphertext too short")
 	}
 
 	nonce := ciphertext[:nonceSize]
@@ -86,54 +90,102 @@ func decrypt(key []byte, ciphertext []byte) (string, error) {
 	)
 
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to decrypt ciphertext: %w", err)
 	}
 
 	return string(plaintext), nil
 }
 
-// loadEncryptionKey resolves the AES key, preferring a key supplied from
-// outside the vault directory.
+// loadEncryptionKey loads the AES-256 encryption key.
 //
-// Order:
-//  1. $API_VAULT_ENCRYPTION_KEY (hex-encoded 32 bytes)
-//  2. storage.key_file from the config
-//  3. <appfolder>/encryption.key, generated on first run
+// Priority:
+//  1. API_VAULT_ENCRYPTION_KEY environment variable
+//  2. storage.key_file from config.yml
+//  3. <appfolder>/encryption.key
 //
-// Option 3 stores the key in the same directory as the encrypted secrets, so
-// anyone who can read the data files can also decrypt them. It stays the
-// default so existing installs keep working, but it warns on every start.
+// The key is 32 bytes and is used for AES-256-GCM.
 func loadEncryptionKey() error {
+
+	// ------------------------------------------------------------
+	// 1. Environment variable
+	// ------------------------------------------------------------
+
 	if raw := strings.TrimSpace(os.Getenv(encryptionKeyEnv)); raw != "" {
 		key, err := hex.DecodeString(raw)
 		if err != nil {
-			return fmt.Errorf("%s is not valid hex: %w", encryptionKeyEnv, err)
+			return fmt.Errorf(
+				"%s is not valid hexadecimal: %w",
+				encryptionKeyEnv,
+				err,
+			)
 		}
 
 		if len(key) != 32 {
-			return fmt.Errorf("%s must decode to 32 bytes, got %d", encryptionKeyEnv, len(key))
+			return fmt.Errorf(
+				"%s must decode to exactly 32 bytes, got %d",
+				encryptionKeyEnv,
+				len(key),
+			)
 		}
 
 		encryptionKey = key
-		logEvent("CRYPTO", "Encryption key loaded from "+encryptionKeyEnv)
+
+		logEvent(
+			"CRYPTO",
+			"Encryption key loaded from "+encryptionKeyEnv,
+		)
+
 		return nil
 	}
 
-	keyPath := config.Storage.KeyFile
+	// ------------------------------------------------------------
+	// 2. Configured key file
+	// ------------------------------------------------------------
+
+	keyPath := strings.TrimSpace(config.Storage.KeyFile)
 	external := keyPath != ""
 
+	// ------------------------------------------------------------
+	// 3. Default key file
+	// ------------------------------------------------------------
+
 	if !external {
-		keyPath = filepath.Join(appfolder, "encryption.key")
+		appFolder := strings.TrimSpace(config.Storage.AppFolder)
+
+		if appFolder == "" {
+			appFolder = "appdata"
+		}
+
+		keyPath = filepath.Join(
+			appFolder,
+			"encryption.key",
+		)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(keyPath), 0700); err != nil {
-		return err
+	// Make sure the parent directory exists.
+	parentDir := filepath.Dir(keyPath)
+
+	if err := os.MkdirAll(parentDir, 0700); err != nil {
+		return fmt.Errorf(
+			"failed to create encryption key directory: %w",
+			err,
+		)
 	}
+
+	// ------------------------------------------------------------
+	// Load existing key
+	// ------------------------------------------------------------
 
 	key, err := os.ReadFile(keyPath)
+
 	if err == nil {
+
 		if len(key) != 32 {
-			return fmt.Errorf("invalid encryption key size in %s: %d bytes, expected 32", keyPath, len(key))
+			return fmt.Errorf(
+				"invalid encryption key in %s: got %d bytes, expected 32",
+				keyPath,
+				len(key),
+			)
 		}
 
 		warnKeyPermissions(keyPath)
@@ -143,49 +195,92 @@ func loadEncryptionKey() error {
 		}
 
 		encryptionKey = key
+
+		logEvent(
+			"CRYPTO",
+			"Encryption key loaded from "+keyPath,
+		)
+
 		return nil
 	}
 
+	// An error other than "file does not exist" is a real failure.
 	if !os.IsNotExist(err) {
-		return fmt.Errorf("failed to read %s: %w", keyPath, err)
+		return fmt.Errorf(
+			"failed to read encryption key %s: %w",
+			keyPath,
+			err,
+		)
 	}
 
-	// Generate new 32-byte key
+	// ------------------------------------------------------------
+	// Generate new AES-256 key
+	// ------------------------------------------------------------
+
 	key = make([]byte, 32)
 
 	if _, err := rand.Read(key); err != nil {
-		return err
+		return fmt.Errorf(
+			"failed to generate encryption key: %w",
+			err,
+		)
 	}
 
-	if err := os.WriteFile(keyPath, key, 0600); err != nil {
-		return err
+	// Write with restrictive permissions.
+	if err := os.WriteFile(
+		keyPath,
+		key,
+		0600,
+	); err != nil {
+		return fmt.Errorf(
+			"failed to save encryption key %s: %w",
+			keyPath,
+			err,
+		)
 	}
 
-	logEvent("CRYPTO", "Generated a new encryption key at "+keyPath)
+	encryptionKey = key
+
+	logEvent(
+		"CRYPTO",
+		"Generated a new encryption key at "+keyPath,
+	)
 
 	if !external {
 		warnKeyBesideData(keyPath)
 	}
 
-	encryptionKey = key
 	return nil
 }
 
+// warnKeyBesideData warns when the encryption key is stored inside the
+// application's data directory.
 func warnKeyBesideData(keyPath string) {
 	log.Printf(
-		"[WARN] The encryption key lives next to the encrypted secrets (%s). "+
-			"Anyone who can read that directory can decrypt the vault. Set %s or storage.key_file to move it.",
-		keyPath, encryptionKeyEnv,
+		"[WARN] Encryption key is stored at %s. "+
+			"Anyone who can read this directory can decrypt the vault. "+
+			"Set %s or storage.key_file to move the key elsewhere.",
+		keyPath,
+		encryptionKeyEnv,
 	)
 }
 
+// warnKeyPermissions checks whether the key file is accessible by
+// users other than its owner.
 func warnKeyPermissions(keyPath string) {
 	info, err := os.Stat(keyPath)
 	if err != nil {
 		return
 	}
 
-	if mode := info.Mode().Perm(); mode&0077 != 0 {
-		log.Printf("[WARN] %s is readable beyond its owner (mode %04o); tighten it to 0600.", keyPath, mode)
+	mode := info.Mode().Perm()
+
+	if mode&0077 != 0 {
+		log.Printf(
+			"[WARN] %s is readable beyond its owner (mode %04o). "+
+				"Tighten permissions to 0600.",
+			keyPath,
+			mode,
+		)
 	}
 }

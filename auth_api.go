@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"database/sql"
 	"encoding/json"
 	"log"
 	"net"
@@ -10,8 +12,10 @@ import (
 	"time"
 )
 
-// Login throttling. Without it the login endpoint will answer brute-force
-// attempts as fast as bcrypt can run.
+// ---------------------------------------------------------
+// LOGIN THROTTLING
+// ---------------------------------------------------------
+
 const (
 	maxFailedAttempts = 10
 	lockoutWindow     = 15 * time.Minute
@@ -29,6 +33,7 @@ var (
 
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
+
 	if err != nil {
 		return r.RemoteAddr
 	}
@@ -41,6 +46,7 @@ func throttled(key string) bool {
 	defer attemptsMu.Unlock()
 
 	record, ok := attempts[key]
+
 	if !ok {
 		return false
 	}
@@ -58,8 +64,12 @@ func noteFailure(key string) {
 	defer attemptsMu.Unlock()
 
 	record, ok := attempts[key]
+
 	if !ok || time.Since(record.first) > lockoutWindow {
-		attempts[key] = &attemptRecord{count: 1, first: time.Now()}
+		attempts[key] = &attemptRecord{
+			count: 1,
+			first: time.Now(),
+		}
 		return
 	}
 
@@ -73,101 +83,167 @@ func clearFailures(key string) {
 	delete(attempts, key)
 }
 
-// ensureAdminAccount creates the configured admin on first start. This used to
-// run inside the login handler, which meant an unauthenticated request could
-// trigger account creation and a users.json write.
-func ensureAdminAccount() error {
-	usersMu.Lock()
-	defer usersMu.Unlock()
+// ---------------------------------------------------------
+// ADMIN ACCOUNT
+// ---------------------------------------------------------
 
-	users, err := loadJSON[APIUser](usersFile)
-	if err != nil {
+func ensureAdminAccount() error {
+
+	var existingID string
+
+	err := db.QueryRow(`
+		SELECT id
+		FROM users
+		WHERE username = ?
+		LIMIT 1
+	`,
+		config.Auth.AdminUsername,
+	).Scan(&existingID)
+
+	// Admin already exists.
+	if err == nil {
+		return nil
+	}
+
+	if err != sql.ErrNoRows {
 		return err
 	}
 
-	for _, u := range users {
-		if u.Username == config.Auth.AdminUsername {
-			return nil
-		}
-	}
+	hashed, err := hashPassword(
+		config.Auth.AdminPassword,
+	)
 
-	hashed, err := hashPassword(config.Auth.AdminPassword)
 	if err != nil {
 		return err
 	}
 
 	id, err := newID()
+
 	if err != nil {
 		return err
 	}
 
-	users = append(users, APIUser{
-		ID:       id,
-		Username: config.Auth.AdminUsername,
-		Email:    "admin@localhost",
-		Password: hashed,
-		Role:     "admin",
-		Status:   "active",
-	})
+	_, err = db.Exec(`
+		INSERT INTO users (
+			id,
+			username,
+			email,
+			password_hash,
+			role,
+			status
+		)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`,
+		id,
+		config.Auth.AdminUsername,
+		"admin@localhost",
+		hashed,
+		"admin",
+		"active",
+	)
 
-	if err := saveJSON(usersFile, users); err != nil {
+	if err != nil {
 		return err
 	}
 
-	logEvent("ADMIN_CREATED", "Default Admin account created")
+	logEvent(
+		"ADMIN_CREATED",
+		"Default Admin account created",
+	)
+
 	return nil
 }
 
-// upgradeStoredHash re-hashes a legacy SHA-256 entry with bcrypt after a
-// successful login, so existing installs migrate without a password reset.
+// ---------------------------------------------------------
+// PASSWORD HASH UPGRADE
+// ---------------------------------------------------------
+
+// Re-hashes a legacy SHA-256 password with bcrypt after
+// successful login.
 func upgradeStoredHash(userID, password string) {
+
 	hashed, err := hashPassword(password)
+
 	if err != nil {
-		log.Printf("[ERROR] Failed to upgrade password hash: %v", err)
+		log.Printf(
+			"[ERROR] Failed to upgrade password hash: %v",
+			err,
+		)
 		return
 	}
 
-	usersMu.Lock()
-	defer usersMu.Unlock()
+	var currentHash string
+	var username string
 
-	users, err := loadJSON[APIUser](usersFile)
+	err = db.QueryRow(`
+		SELECT
+			username,
+			password_hash
+		FROM users
+		WHERE id = ?
+		LIMIT 1
+	`,
+		userID,
+	).Scan(
+		&username,
+		&currentHash,
+	)
+
 	if err != nil {
-		log.Printf("[ERROR] Failed to load users for hash upgrade: %v", err)
+		log.Printf(
+			"[ERROR] Failed to load password hash for upgrade: %v",
+			err,
+		)
 		return
 	}
 
-	for i := range users {
-		if users[i].ID != userID {
-			continue
-		}
-
-		// Re-check: another request may have upgraded it already.
-		if !isLegacyHash(users[i].Password) {
-			return
-		}
-
-		users[i].Password = hashed
-
-		if err := saveJSON(usersFile, users); err != nil {
-			log.Printf("[ERROR] Failed to save upgraded password hash: %v", err)
-			return
-		}
-
-		logEvent("HASH_UPGRADED", "Password hash migrated to bcrypt for "+users[i].Username)
+	// Another request may already have upgraded it.
+	if !isLegacyHash(currentHash) {
 		return
 	}
+
+	_, err = db.Exec(`
+		UPDATE users
+		SET password_hash = ?
+		WHERE id = ?
+	`,
+		hashed,
+		userID,
+	)
+
+	if err != nil {
+		log.Printf(
+			"[ERROR] Failed to save upgraded password hash: %v",
+			err,
+		)
+		return
+	}
+
+	logEvent(
+		"HASH_UPGRADED",
+		"Password hash migrated to bcrypt for "+username,
+	)
 }
 
-// Handles login.
+// ---------------------------------------------------------
+// LOGIN
+// ---------------------------------------------------------
 
 func handleLoginPost(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(
+			w,
+			"Method not allowed",
+			http.StatusMethodNotAllowed,
+		)
 		return
 	}
 
-	logEvent("LOGIN_ATTEMPT", "Login request received")
+	logEvent(
+		"LOGIN_ATTEMPT",
+		"Login request received",
+	)
 
 	var data struct {
 		Username string `json:"username"`
@@ -175,87 +251,216 @@ func handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
-		log.Printf("[ERROR] Invalid login JSON: %v", err)
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		log.Printf(
+			"[ERROR] Invalid login JSON: %v",
+			err,
+		)
+
+		http.Error(
+			w,
+			"Invalid JSON",
+			http.StatusBadRequest,
+		)
 		return
 	}
 
 	data.Username = strings.TrimSpace(data.Username)
-	throttleKey := clientIP(r) + "|" + strings.ToLower(data.Username)
+
+	throttleKey :=
+		clientIP(r) +
+			"|" +
+			strings.ToLower(data.Username)
 
 	if throttled(throttleKey) {
-		logEvent("AUTH_THROTTLED", "Too many failed logins for "+data.Username)
-		http.Error(w, "Too many failed attempts, try again later", http.StatusTooManyRequests)
+
+		logEvent(
+			"AUTH_THROTTLED",
+			"Too many failed logins for "+data.Username,
+		)
+
+		http.Error(
+			w,
+			"Too many failed attempts, try again later",
+			http.StatusTooManyRequests,
+		)
+
 		return
 	}
 
-	users, err := loadJSON[APIUser](usersFile)
+	// -----------------------------------------------------
+	// Load user from MySQL
+	// -----------------------------------------------------
+
+	var user APIUser
+
+	err := db.QueryRow(`
+		SELECT
+			id,
+			username,
+			email,
+			password_hash,
+			role,
+			status
+		FROM users
+		WHERE username = ?
+		LIMIT 1
+	`,
+		data.Username,
+	).Scan(
+		&user.ID,
+		&user.Username,
+		&user.Email,
+		&user.Password,
+		&user.Role,
+		&user.Status,
+	)
+
+	// Same response for nonexistent users and invalid
+	// passwords to avoid username enumeration.
+	if err == sql.ErrNoRows {
+
+		noteFailure(throttleKey)
+
+		logEvent(
+			"AUTH_FAILED",
+			"Unknown username",
+		)
+
+		http.Error(
+			w,
+			"Invalid username or password",
+			http.StatusUnauthorized,
+		)
+
+		return
+	}
 
 	if err != nil {
-		log.Printf("[ERROR] Failed to load users: %v", err)
-		http.Error(w, "Failed to load users", http.StatusInternalServerError)
+
+		log.Printf(
+			"[ERROR] Failed to load user: %v",
+			err,
+		)
+
+		http.Error(
+			w,
+			"Failed to load user",
+			http.StatusInternalServerError,
+		)
+
 		return
 	}
 
-	var user *APIUser
+	// -----------------------------------------------------
+	// Verify password
+	// -----------------------------------------------------
 
-	for i := range users {
-		if users[i].Username == data.Username {
-			user = &users[i]
-			break
-		}
-	}
-
-	// One message and one code for every failure, so the response does not
-	// say whether the username exists or the account is disabled.
-	if user == nil {
-		noteFailure(throttleKey)
-		logEvent("AUTH_FAILED", "Unknown username")
-		http.Error(w, "Invalid username or password", http.StatusUnauthorized)
-		return
-	}
-
-	valid, needsUpgrade := verifyPassword(user.Password, data.Password)
+	valid, needsUpgrade := verifyPassword(
+		user.Password,
+		data.Password,
+	)
 
 	if !valid {
+
 		noteFailure(throttleKey)
-		logEvent("AUTH_FAILED", "Invalid password for: "+user.Username)
-		http.Error(w, "Invalid username or password", http.StatusUnauthorized)
+
+		logEvent(
+			"AUTH_FAILED",
+			"Invalid password for: "+user.Username,
+		)
+
+		http.Error(
+			w,
+			"Invalid username or password",
+			http.StatusUnauthorized,
+		)
+
 		return
 	}
+
+	// -----------------------------------------------------
+	// Check account status
+	// -----------------------------------------------------
 
 	if user.Status != "active" {
+
 		noteFailure(throttleKey)
-		logEvent("AUTH_FAILED", "Inactive user: "+user.Username)
-		http.Error(w, "Invalid username or password", http.StatusUnauthorized)
+
+		logEvent(
+			"AUTH_FAILED",
+			"Inactive user: "+user.Username,
+		)
+
+		http.Error(
+			w,
+			"Invalid username or password",
+			http.StatusUnauthorized,
+		)
+
 		return
 	}
 
+	// Upgrade old SHA-256 hash to bcrypt.
 	if needsUpgrade {
-		upgradeStoredHash(user.ID, data.Password)
+		upgradeStoredHash(
+			user.ID,
+			data.Password,
+		)
 	}
 
 	clearFailures(throttleKey)
 
+	// -----------------------------------------------------
 	// Create session
+	// -----------------------------------------------------
+
 	sessionID, err := createSession()
 
 	if err != nil {
-		log.Printf("[ERROR] Failed to create session: %v", err)
-		http.Error(w, "Failed to create session", 500)
+
+		log.Printf(
+			"[ERROR] Failed to create session: %v",
+			err,
+		)
+
+		http.Error(
+			w,
+			"Failed to create session",
+			http.StatusInternalServerError,
+		)
+
 		return
 	}
 
-	if err := storeSession(sessionID, Session{
+	session := Session{
+		ID:        sessionID,
 		UserID:    user.ID,
 		ExpiresAt: time.Now().Add(sessionDuration),
-	}); err != nil {
-		log.Printf("[ERROR] Failed to save session: %v", err)
-		http.Error(w, "Failed to save session", 500)
+	}
+
+	if err := storeSession(
+		sessionID,
+		session,
+	); err != nil {
+
+		log.Printf(
+			"[ERROR] Failed to save session: %v",
+			err,
+		)
+
+		http.Error(
+			w,
+			"Failed to save session",
+			http.StatusInternalServerError,
+		)
+
 		return
 	}
 
-	setSessionCookie(w, sessionID)
+	setSessionCookie(
+		w,
+		sessionID,
+	)
 
 	logEvent(
 		"LOGIN_SUCCESS",
@@ -270,15 +475,22 @@ func handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	)
 }
 
-// Handles logout.
+// ---------------------------------------------------------
+// LOGOUT
+// ---------------------------------------------------------
 
 func handleLogout(w http.ResponseWriter, r *http.Request) {
 
 	cookie, err := r.Cookie("session")
 
 	if err == nil {
+
 		if err := dropSession(cookie.Value); err != nil {
-			log.Printf("[ERROR] Failed to save sessions: %v", err)
+
+			log.Printf(
+				"[ERROR] Failed to delete session: %v",
+				err,
+			)
 		}
 
 		logEvent(
@@ -296,3 +508,7 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 		http.StatusSeeOther,
 	)
 }
+
+// Keep crypto/rand referenced if newID/createSession
+// isn't the only random ID generator in this package.
+var _ = rand.Reader

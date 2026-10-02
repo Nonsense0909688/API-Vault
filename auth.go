@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"log"
 	"net/http"
@@ -10,63 +11,108 @@ import (
 
 const defaultSessionDuration = 24 * time.Hour
 
-// sessionDuration is resolved from the config at startup; it stays at the
-// default when the config omits or misstates it.
 var sessionDuration = defaultSessionDuration
 
 func initSessionDuration() {
 	raw := config.Session.Duration
+
 	if raw == "" {
 		return
 	}
 
 	d, err := time.ParseDuration(raw)
 	if err != nil {
-		log.Printf("[WARN] Invalid session.duration %q, using %s: %v", raw, defaultSessionDuration, err)
+		log.Printf(
+			"[WARN] Invalid session.duration %q, using %s: %v",
+			raw,
+			defaultSessionDuration,
+			err,
+		)
 		return
 	}
 
 	if d <= 0 {
-		log.Printf("[WARN] session.duration must be positive, using %s", defaultSessionDuration)
+		log.Printf(
+			"[WARN] session.duration must be positive, using %s",
+			defaultSessionDuration,
+		)
 		return
 	}
 
 	sessionDuration = d
 }
 
-// lookupSession resolves a cookie to a live session, dropping it if expired.
+// ---------------------------------------------------------
+// LOOKUP SESSION
+// ---------------------------------------------------------
+
+// lookupSession resolves the session cookie using MySQL.
 func lookupSession(r *http.Request) (Session, bool) {
+
 	cookie, err := r.Cookie("session")
 	if err != nil {
 		return Session{}, false
 	}
 
-	sessionsMu.RLock()
-	session, exists := sessions[cookie.Value]
-	sessionsMu.RUnlock()
+	var session Session
 
-	if !exists {
+	err = db.QueryRow(`
+		SELECT
+			id,
+			user_id,
+			expires_at
+		FROM sessions
+		WHERE id = ?
+		LIMIT 1
+	`,
+		cookie.Value,
+	).Scan(
+		&session.ID,
+		&session.UserID,
+		&session.ExpiresAt,
+	)
+
+	if err == sql.ErrNoRows {
 		return Session{}, false
 	}
 
-	if time.Now().After(session.ExpiresAt) {
-		sessionsMu.Lock()
-		delete(sessions, cookie.Value)
-		err := saveSessionsLocked()
-		sessionsMu.Unlock()
+	if err != nil {
+		log.Printf(
+			"[ERROR] Failed to lookup session: %v",
+			err,
+		)
+		return Session{}, false
+	}
 
-		if err != nil {
-			log.Printf("[ERROR] Failed to persist session expiry: %v", err)
+	// Session expired.
+	if time.Now().After(session.ExpiresAt) {
+
+		if _, err := db.Exec(`
+			DELETE FROM sessions
+			WHERE id = ?
+		`, session.ID); err != nil {
+
+			log.Printf(
+				"[ERROR] Failed to remove expired session: %v",
+				err,
+			)
 		}
 
-		logEvent("SESSION_EXPIRED", "Session has expired")
+		logEvent(
+			"SESSION_EXPIRED",
+			"Session has expired",
+		)
+
 		return Session{}, false
 	}
 
 	return session, true
 }
 
-// Check if the request carries a valid session.
+// ---------------------------------------------------------
+// AUTHENTICATION
+// ---------------------------------------------------------
+
 func isAuthenticated(r *http.Request) bool {
 	_, ok := lookupSession(r)
 	return ok
@@ -74,7 +120,9 @@ func isAuthenticated(r *http.Request) bool {
 
 // Get the logged-in user's ID.
 func getSessionUserID(r *http.Request) (string, bool) {
+
 	session, ok := lookupSession(r)
+
 	if !ok {
 		return "", false
 	}
@@ -82,8 +130,12 @@ func getSessionUserID(r *http.Request) (string, bool) {
 	return session.UserID, true
 }
 
-// Create new session id for user.
+// ---------------------------------------------------------
+// SESSION ID
+// ---------------------------------------------------------
+
 func createSession() (string, error) {
+
 	bytes := make([]byte, 32)
 
 	if _, err := rand.Read(bytes); err != nil {
@@ -93,44 +145,91 @@ func createSession() (string, error) {
 	return hex.EncodeToString(bytes), nil
 }
 
+// ---------------------------------------------------------
+// STORE SESSION
+// ---------------------------------------------------------
+
 func storeSession(sessionID string, session Session) error {
-	sessionsMu.Lock()
-	defer sessionsMu.Unlock()
 
-	sessions[sessionID] = session
+	_, err := db.Exec(`
+		INSERT INTO sessions (
+			id,
+			user_id,
+			expires_at
+		)
+		VALUES (?, ?, ?)
+	`,
+		sessionID,
+		session.UserID,
+		session.ExpiresAt,
+	)
 
-	if err := saveSessionsLocked(); err != nil {
-		delete(sessions, sessionID)
+	if err != nil {
+		log.Printf(
+			"[ERROR] Failed to store session: %v",
+			err,
+		)
+
 		return err
 	}
 
 	return nil
 }
 
+// ---------------------------------------------------------
+// DROP SESSION
+// ---------------------------------------------------------
+
 func dropSession(sessionID string) error {
-	sessionsMu.Lock()
-	defer sessionsMu.Unlock()
 
-	delete(sessions, sessionID)
-	return saveSessionsLocked()
-}
+	_, err := db.Exec(`
+		DELETE FROM sessions
+		WHERE id = ?
+	`,
+		sessionID,
+	)
 
-// Invalidate every session belonging to a user, used when the account is
-// deleted or deactivated so an existing cookie cannot outlive the change.
-func dropSessionsForUser(userID string) error {
-	sessionsMu.Lock()
-	defer sessionsMu.Unlock()
-
-	for id, session := range sessions {
-		if session.UserID == userID {
-			delete(sessions, id)
-		}
+	if err != nil {
+		log.Printf(
+			"[ERROR] Failed to delete session: %v",
+			err,
+		)
 	}
 
-	return saveSessionsLocked()
+	return err
 }
 
+// ---------------------------------------------------------
+// DROP ALL USER SESSIONS
+// ---------------------------------------------------------
+
+// Invalidate every session belonging to a user.
+// Used when an account is deleted or deactivated.
+func dropSessionsForUser(userID string) error {
+
+	_, err := db.Exec(`
+		DELETE FROM sessions
+		WHERE user_id = ?
+	`,
+		userID,
+	)
+
+	if err != nil {
+		log.Printf(
+			"[ERROR] Failed to delete user sessions: %v",
+			err,
+		)
+	}
+
+	return err
+}
+
+// ---------------------------------------------------------
+// SESSION COOKIE
+// ---------------------------------------------------------
+
 func setSessionCookie(w http.ResponseWriter, sessionID string) {
+
 	http.SetCookie(w, &http.Cookie{
 		Name:  "session",
 		Value: sessionID,
@@ -147,6 +246,7 @@ func setSessionCookie(w http.ResponseWriter, sessionID string) {
 }
 
 func clearSessionCookie(w http.ResponseWriter) {
+
 	http.SetCookie(w, &http.Cookie{
 		Name:  "session",
 		Value: "",

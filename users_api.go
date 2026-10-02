@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -17,29 +18,63 @@ import (
 // ================= USERS =================
 
 func handleAPIUsers(w http.ResponseWriter, r *http.Request) {
-
-	if !isAuthenticated(r) {
-		http.Error(w, "Unauthorized", 401)
+	user, ok := requireUser(w, r)
+	if !ok {
 		return
 	}
 
-	users, err := loadJSON[APIUser](usersFile)
-
+	// The user-management/share picker needs public user information only.
+	// Password hashes must never be returned.
+	rows, err := db.Query(`
+		SELECT id, username, email, role, status
+		FROM users
+		ORDER BY username ASC
+	`)
 	if err != nil {
-		http.Error(w, "Failed to load users", 500)
+		log.Printf("[ERROR] Failed to load users: %v", err)
+		http.Error(w, "Failed to load users", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	users := make([]APIUser, 0)
+
+	for rows.Next() {
+		var u APIUser
+
+		if err := rows.Scan(
+			&u.ID,
+			&u.Username,
+			&u.Email,
+			&u.Role,
+			&u.Status,
+		); err != nil {
+			log.Printf("[ERROR] Failed to scan user: %v", err)
+			http.Error(w, "Failed to load users", http.StatusInternalServerError)
+			return
+		}
+
+		users = append(users, u)
+	}
+
+	if err := rows.Err(); err != nil {
+		log.Printf("[ERROR] Failed while reading users: %v", err)
+		http.Error(w, "Failed to load users", http.StatusInternalServerError)
 		return
 	}
 
-	// Never hand out password hashes: the share picker only needs the id,
-	// name and email, and an unsalted hash is cheap to crack offline.
-	jsonOut(w, publicUsers(users))
+	_ = user // authenticated user is intentionally allowed to see public users
+
+	jsonOut(w, users)
 }
 
 func handleCreateUser(w http.ResponseWriter, r *http.Request) {
-
-	// Creating accounts is an admin action. This used to accept any logged-in
-	// user, so a regular account could mint more accounts at will.
 	if !requireAdmin(w, r) {
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -51,54 +86,62 @@ func handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	user.Username = strings.TrimSpace(user.Username)
+	user.Email = strings.TrimSpace(user.Email)
 
 	if user.Username == "" || user.Password == "" {
-		http.Error(w, "Username and password are required", 400)
+		http.Error(w, "Username and password are required", http.StatusBadRequest)
 		return
 	}
 
 	hashed, err := hashPassword(user.Password)
 	if err != nil {
 		log.Printf("[ERROR] Failed to hash password: %v", err)
-		http.Error(w, "Failed to create user", 500)
+		http.Error(w, "Failed to create user", http.StatusInternalServerError)
 		return
 	}
 
 	id, err := newID()
 	if err != nil {
 		log.Printf("[ERROR] Failed to generate user id: %v", err)
-		http.Error(w, "Failed to create user", 500)
+		http.Error(w, "Failed to create user", http.StatusInternalServerError)
 		return
 	}
 
-	user.ID = id
-	user.Password = hashed
-
-	// Users created through this endpoint are normal users.
-	user.Role = "user"
-	user.Status = "active"
-
-	usersMu.Lock()
-	defer usersMu.Unlock()
-
-	users, err := loadJSON[APIUser](usersFile)
+	_, err = db.Exec(`
+		INSERT INTO users (
+			id,
+			username,
+			email,
+			password_hash,
+			role,
+			status
+		)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`,
+		id,
+		user.Username,
+		user.Email,
+		hashed,
+		"user",
+		"active",
+	)
 
 	if err != nil {
-		http.Error(w, "Failed to load users", 500)
-		return
-	}
-
-	for _, existing := range users {
-		if strings.EqualFold(existing.Username, user.Username) {
-			http.Error(w, "Username already taken", http.StatusConflict)
+		if isDuplicateError(err) {
+			http.Error(
+				w,
+				"Username already taken",
+				http.StatusConflict,
+			)
 			return
 		}
-	}
 
-	users = append(users, user)
-
-	if err := saveJSON(usersFile, users); err != nil {
-		http.Error(w, "Failed to save user", 500)
+		log.Printf("[ERROR] Failed to create user: %v", err)
+		http.Error(
+			w,
+			"Failed to create user",
+			http.StatusInternalServerError,
+		)
 		return
 	}
 
@@ -106,13 +149,17 @@ func handleCreateUser(w http.ResponseWriter, r *http.Request) {
 
 	jsonOut(w, map[string]string{
 		"status": "created",
-		"id":     user.ID,
+		"id":     id,
 	})
 }
 
 func handleUserStatus(w http.ResponseWriter, r *http.Request) {
-
 	if !requireAdmin(w, r) {
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -122,64 +169,115 @@ func handleUserStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
-		http.Error(w, "Invalid JSON", 400)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	data.ID = strings.TrimSpace(data.ID)
+
+	if data.ID == "" {
+		http.Error(w, "User ID is required", http.StatusBadRequest)
 		return
 	}
 
 	if data.Status != "active" && data.Status != "inactive" {
-		http.Error(w, "Invalid status", 400)
+		http.Error(w, "Invalid status", http.StatusBadRequest)
 		return
 	}
 
-	usersMu.Lock()
+	var (
+		username string
+		role     string
+		status   string
+	)
 
-	users, err := loadJSON[APIUser](usersFile)
+	err := db.QueryRow(`
+		SELECT username, role, status
+		FROM users
+		WHERE id = ?
+		LIMIT 1
+	`, data.ID).Scan(
+		&username,
+		&role,
+		&status,
+	)
+
+	if err == sql.ErrNoRows {
+		http.Error(w, "User not found", http.StatusNotFound)
+		return
+	}
 
 	if err != nil {
-		usersMu.Unlock()
-		http.Error(w, "Failed to load users", 500)
+		log.Printf("[ERROR] Failed to load user status: %v", err)
+		http.Error(w, "Failed to load user", http.StatusInternalServerError)
 		return
 	}
 
-	found := false
+	// Prevent disabling the last active administrator.
+	if data.Status == "inactive" &&
+		role == "admin" &&
+		status == "active" {
 
-	for i := range users {
+		var activeAdmins int
 
-		if users[i].ID == data.ID {
+		err := db.QueryRow(`
+			SELECT COUNT(*)
+			FROM users
+			WHERE role = 'admin'
+			  AND status = 'active'
+		`).Scan(&activeAdmins)
 
-			users[i].Status = data.Status
-			found = true
+		if err != nil {
+			log.Printf("[ERROR] Failed to count active admins: %v", err)
+			http.Error(
+				w,
+				"Failed to validate administrator status",
+				http.StatusInternalServerError,
+			)
+			return
+		}
 
-			break
+		if activeAdmins <= 1 {
+			http.Error(
+				w,
+				"Cannot deactivate the last active admin",
+				http.StatusConflict,
+			)
+			return
 		}
 	}
 
-	if !found {
-		usersMu.Unlock()
-		http.Error(w, "User not found", 404)
+	_, err = db.Exec(`
+		UPDATE users
+		SET status = ?
+		WHERE id = ?
+	`, data.Status, data.ID)
+
+	if err != nil {
+		log.Printf("[ERROR] Failed to update user status: %v", err)
+		http.Error(
+			w,
+			"Failed to update user",
+			http.StatusInternalServerError,
+		)
 		return
 	}
 
-	if data.Status == "inactive" && !hasActiveAdmin(users) {
-		usersMu.Unlock()
-		http.Error(w, "Cannot deactivate the last active admin", http.StatusConflict)
-		return
-	}
-
-	if err := saveJSON(usersFile, users); err != nil {
-		usersMu.Unlock()
-		http.Error(w, "Failed to save users", 500)
-		return
-	}
-
-	usersMu.Unlock()
-
-	// A deactivated account must not keep working through an existing cookie.
+	// Immediately invalidate sessions when disabling an account.
 	if data.Status == "inactive" {
 		if err := dropSessionsForUser(data.ID); err != nil {
-			log.Printf("[ERROR] Failed to drop sessions for %s: %v", data.ID, err)
+			log.Printf(
+				"[ERROR] Failed to drop sessions for %s: %v",
+				data.ID,
+				err,
+			)
 		}
 	}
+
+	logEvent(
+		"USER_STATUS_CHANGED",
+		fmt.Sprintf("%s -> %s", username, data.Status),
+	)
 
 	jsonOut(w, map[string]string{
 		"status": "updated",
@@ -187,8 +285,12 @@ func handleUserStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleDeleteUser(w http.ResponseWriter, r *http.Request) {
-
 	if !requireAdmin(w, r) {
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -197,113 +299,279 @@ func handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
-		http.Error(w, "Invalid JSON", 400)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
 
-	usersMu.Lock()
+	data.ID = strings.TrimSpace(data.ID)
 
-	users, err := loadJSON[APIUser](usersFile)
+	if data.ID == "" {
+		http.Error(w, "User ID is required", http.StatusBadRequest)
+		return
+	}
+
+	var (
+		username string
+		role     string
+		status   string
+	)
+
+	err := db.QueryRow(`
+		SELECT username, role, status
+		FROM users
+		WHERE id = ?
+		LIMIT 1
+	`, data.ID).Scan(
+		&username,
+		&role,
+		&status,
+	)
+
+	if err == sql.ErrNoRows {
+		http.Error(w, "User not found", http.StatusNotFound)
+		return
+	}
 
 	if err != nil {
-		usersMu.Unlock()
-		http.Error(w, "Failed to load users", 500)
+		log.Printf("[ERROR] Failed to load user: %v", err)
+		http.Error(w, "Failed to load user", http.StatusInternalServerError)
 		return
 	}
 
-	found := false
-	result := make([]APIUser, 0, len(users))
+	// Prevent deleting the last active administrator.
+	if role == "admin" && status == "active" {
+		var activeAdmins int
 
-	for _, user := range users {
+		err := db.QueryRow(`
+			SELECT COUNT(*)
+			FROM users
+			WHERE role = 'admin'
+			  AND status = 'active'
+		`).Scan(&activeAdmins)
 
-		if user.ID == data.ID {
-			found = true
-			continue
+		if err != nil {
+			log.Printf("[ERROR] Failed to count active admins: %v", err)
+			http.Error(
+				w,
+				"Failed to validate administrator status",
+				http.StatusInternalServerError,
+			)
+			return
 		}
 
-		result = append(result, user)
+		if activeAdmins <= 1 {
+			http.Error(
+				w,
+				"Cannot delete the last active admin",
+				http.StatusConflict,
+			)
+			return
+		}
 	}
 
-	if !found {
-		usersMu.Unlock()
-		http.Error(w, "User not found", 404)
+	// sessions, permissions, and owned secrets are removed automatically
+	// through the foreign-key ON DELETE CASCADE rules.
+	_, err = db.Exec(`
+		DELETE FROM users
+		WHERE id = ?
+	`, data.ID)
+
+	if err != nil {
+		log.Printf("[ERROR] Failed to delete user: %v", err)
+		http.Error(
+			w,
+			"Failed to delete user",
+			http.StatusInternalServerError,
+		)
 		return
 	}
 
-	if !hasActiveAdmin(result) {
-		usersMu.Unlock()
-		http.Error(w, "Cannot delete the last active admin", http.StatusConflict)
-		return
-	}
-
-	if err := saveJSON(usersFile, result); err != nil {
-		usersMu.Unlock()
-		http.Error(w, "Failed to save users", 500)
-		return
-	}
-
-	usersMu.Unlock()
-
-	if err := dropSessionsForUser(data.ID); err != nil {
-		log.Printf("[ERROR] Failed to drop sessions for %s: %v", data.ID, err)
-	}
-
-	logEvent("USER_DELETED", "Account removed: "+data.ID)
+	logEvent(
+		"USER_DELETED",
+		"Account removed: "+username,
+	)
 
 	jsonOut(w, map[string]string{
 		"status": "deleted",
 	})
 }
 
-func hasActiveAdmin(users []APIUser) bool {
-	for _, user := range users {
-		if user.Role == "admin" && user.Status == "active" {
-			return true
-		}
-	}
-	return false
-}
-
 // ================= SECRET ACCESS =================
 
-func handleGetSecretAccess(w http.ResponseWriter, r *http.Request) {
+// resolveSecretID resolves a secret from the request.
+//
+// New clients should send:
+//
+//	secret_id
+//
+// The old key parameter is still supported for compatibility.
+func resolveSecretID(
+	r *http.Request,
+	user *APIUser,
+) (int64, error) {
 
+	secretIDRaw := strings.TrimSpace(
+		r.URL.Query().Get("secret_id"),
+	)
+
+	if secretIDRaw != "" {
+		var secretID int64
+
+		if _, err := fmt.Sscanf(secretIDRaw, "%d", &secretID); err != nil {
+			return 0, fmt.Errorf("invalid secret_id")
+		}
+
+		if secretID <= 0 {
+			return 0, fmt.Errorf("invalid secret_id")
+		}
+
+		return secretID, nil
+	}
+
+	key := strings.TrimSpace(r.URL.Query().Get("key"))
+
+	if key == "" {
+		return 0, fmt.Errorf("secret_id or key is required")
+	}
+
+	var (
+		secretID int64
+		ownerID  string
+	)
+
+	var err error
+
+	if isAdmin(user) {
+		err = db.QueryRow(`
+			SELECT id, created_by
+			FROM secrets
+			WHERE secret_key = ?
+			ORDER BY id DESC
+			LIMIT 1
+		`, key).Scan(
+			&secretID,
+			&ownerID,
+		)
+	} else {
+		err = db.QueryRow(`
+			SELECT id, created_by
+			FROM secrets
+			WHERE secret_key = ?
+			  AND created_by = ?
+			LIMIT 1
+		`, key, user.ID).Scan(
+			&secretID,
+			&ownerID,
+		)
+	}
+
+	if err == sql.ErrNoRows {
+		return 0, sql.ErrNoRows
+	}
+
+	if err != nil {
+		return 0, err
+	}
+
+	return secretID, nil
+}
+
+func handleGetSecretAccess(w http.ResponseWriter, r *http.Request) {
 	user, ok := requireUser(w, r)
 	if !ok {
 		return
 	}
 
-	key := r.URL.Query().Get("key")
+	secretID, err := resolveSecretID(r, user)
 
-	// Who a secret is shared with is only the owner's and an admin's business.
-	if !canAdministerSecret(user, key) {
-		http.Error(w, "Not allowed to manage this secret", http.StatusForbidden)
+	if err == sql.ErrNoRows {
+		http.Error(w, "Secret not found", http.StatusNotFound)
 		return
 	}
-
-	permissions, err := loadJSON[Permission](permissionsFile)
 
 	if err != nil {
-		http.Error(w, "Failed to load permissions", 500)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	for _, permission := range permissions {
-
-		if permission.Key == key {
-			jsonOut(w, permission)
-			return
-		}
+	if !canAdministerSecret(user, secretID) {
+		http.Error(
+			w,
+			"Not allowed to manage this secret",
+			http.StatusForbidden,
+		)
+		return
 	}
 
-	jsonOut(w, Permission{
-		Key:     key,
-		UserIDs: []string{},
-	})
+	permission := Permission{
+		SecretID: secretID,
+		UserIDs:  []string{},
+	}
+
+	rows, err := db.Query(`
+		SELECT user_id
+		FROM secret_permissions
+		WHERE secret_id = ?
+		ORDER BY user_id
+	`, secretID)
+
+	if err != nil {
+		log.Printf(
+			"[ERROR] Failed to load secret permissions: %v",
+			err,
+		)
+
+		http.Error(
+			w,
+			"Failed to load permissions",
+			http.StatusInternalServerError,
+		)
+		return
+	}
+
+	defer rows.Close()
+
+	for rows.Next() {
+		var userID string
+
+		if err := rows.Scan(&userID); err != nil {
+			log.Printf(
+				"[ERROR] Failed to scan secret permission: %v",
+				err,
+			)
+
+			http.Error(
+				w,
+				"Failed to load permissions",
+				http.StatusInternalServerError,
+			)
+			return
+		}
+
+		permission.UserIDs = append(
+			permission.UserIDs,
+			userID,
+		)
+	}
+
+	if err := rows.Err(); err != nil {
+		log.Printf(
+			"[ERROR] Failed reading secret permissions: %v",
+			err,
+		)
+
+		http.Error(
+			w,
+			"Failed to load permissions",
+			http.StatusInternalServerError,
+		)
+		return
+	}
+
+	jsonOut(w, permission)
 }
 
 func handleSaveSecretAccess(w http.ResponseWriter, r *http.Request) {
-
 	user, ok := requireUser(w, r)
 	if !ok {
 		return
@@ -312,21 +580,34 @@ func handleSaveSecretAccess(w http.ResponseWriter, r *http.Request) {
 	var permission Permission
 
 	if err := json.NewDecoder(r.Body).Decode(&permission); err != nil {
-		http.Error(w, "Invalid JSON", 400)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
 
-	if permission.Key == "" {
-		http.Error(w, "Secret key is required", 400)
+	if permission.SecretID <= 0 {
+		http.Error(
+			w,
+			"secret_id is required",
+			http.StatusBadRequest,
+		)
 		return
 	}
 
-	// This endpoint decides who may read a secret. Without an ownership check
-	// any logged-in user could grant themselves access to every entry in the
-	// vault, which defeats the per-user model entirely.
-	if !canAdministerSecret(user, permission.Key) {
-		logEvent("ACCESS_DENIED", "User "+user.Username+" tried to change sharing for "+permission.Key)
-		http.Error(w, "Not allowed to manage this secret", http.StatusForbidden)
+	if !canAdministerSecret(user, permission.SecretID) {
+		logEvent(
+			"ACCESS_DENIED",
+			fmt.Sprintf(
+				"User %s tried to change sharing for secret %d",
+				user.Username,
+				permission.SecretID,
+			),
+		)
+
+		http.Error(
+			w,
+			"Not allowed to manage this secret",
+			http.StatusForbidden,
+		)
 		return
 	}
 
@@ -334,61 +615,155 @@ func handleSaveSecretAccess(w http.ResponseWriter, r *http.Request) {
 		permission.UserIDs = []string{}
 	}
 
-	permissionsMu.Lock()
-	defer permissionsMu.Unlock()
+	// Make sure the secret actually exists.
+	var exists int
 
-	permissions, err := loadJSON[Permission](permissionsFile)
+	err := db.QueryRow(`
+		SELECT 1
+		FROM secrets
+		WHERE id = ?
+		LIMIT 1
+	`, permission.SecretID).Scan(&exists)
+
+	if err == sql.ErrNoRows {
+		http.Error(w, "Secret not found", http.StatusNotFound)
+		return
+	}
 
 	if err != nil {
-		http.Error(w, "Failed to load permissions", 500)
+		log.Printf(
+			"[ERROR] Failed to check secret: %v",
+			err,
+		)
+
+		http.Error(
+			w,
+			"Failed to check secret",
+			http.StatusInternalServerError,
+		)
 		return
 	}
 
-	for i := range permissions {
-
-		if permissions[i].Key != permission.Key {
-			continue
-		}
-
-		permissions[i] = permission
-
-		if err := saveJSON(
-			permissionsFile,
-			permissions,
-		); err != nil {
-
-			http.Error(
-				w,
-				"Failed to save permissions",
-				500,
-			)
-
-			return
-		}
-
-		jsonOut(w, map[string]string{
-			"status": "updated",
-		})
-
-		return
-	}
-
-	permissions = append(
-		permissions,
-		permission,
-	)
-
-	if err := saveJSON(
-		permissionsFile,
-		permissions,
-	); err != nil {
+	tx, err := db.Begin()
+	if err != nil {
+		log.Printf(
+			"[ERROR] Failed to begin permission transaction: %v",
+			err,
+		)
 
 		http.Error(
 			w,
 			"Failed to save permissions",
-			500,
+			http.StatusInternalServerError,
+		)
+		return
+	}
+
+	defer tx.Rollback()
+
+	// Replace the entire permission set atomically.
+	if _, err := tx.Exec(`
+		DELETE FROM secret_permissions
+		WHERE secret_id = ?
+	`, permission.SecretID); err != nil {
+
+		log.Printf(
+			"[ERROR] Failed to clear secret permissions: %v",
+			err,
 		)
 
+		http.Error(
+			w,
+			"Failed to save permissions",
+			http.StatusInternalServerError,
+		)
+		return
+	}
+
+	// Prevent duplicate user IDs from causing unnecessary INSERT errors.
+	seen := make(map[string]struct{})
+
+	for _, userID := range permission.UserIDs {
+		userID = strings.TrimSpace(userID)
+
+		if userID == "" {
+			continue
+		}
+
+		if userID == user.ID {
+			// The owner does not need a permission row for their own secret.
+			continue
+		}
+
+		if _, exists := seen[userID]; exists {
+			continue
+		}
+
+		seen[userID] = struct{}{}
+
+		// Only allow sharing with existing users.
+		var userExists int
+
+		err := tx.QueryRow(`
+			SELECT 1
+			FROM users
+			WHERE id = ?
+			LIMIT 1
+		`, userID).Scan(&userExists)
+
+		if err == sql.ErrNoRows {
+			continue
+		}
+
+		if err != nil {
+			log.Printf(
+				"[ERROR] Failed to validate user %s: %v",
+				userID,
+				err,
+			)
+
+			http.Error(
+				w,
+				"Failed to validate shared user",
+				http.StatusInternalServerError,
+			)
+			return
+		}
+
+		if _, err := tx.Exec(`
+			INSERT INTO secret_permissions (
+				secret_id,
+				user_id
+			)
+			VALUES (?, ?)
+		`, permission.SecretID, userID); err != nil {
+
+			log.Printf(
+				"[ERROR] Failed to add permission for user %s: %v",
+				userID,
+				err,
+			)
+
+			http.Error(
+				w,
+				"Failed to save permissions",
+				http.StatusInternalServerError,
+			)
+			return
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.Printf(
+			"[ERROR] Failed to commit permissions: %v",
+			err,
+		)
+
+		http.Error(
+			w,
+			"Failed to save permissions",
+			http.StatusInternalServerError,
+		)
 		return
 	}
 
@@ -400,13 +775,14 @@ func handleSaveSecretAccess(w http.ResponseWriter, r *http.Request) {
 // ================= HELPERS =================
 
 func jsonOut(w http.ResponseWriter, data interface{}) {
-
 	w.Header().Set(
 		"Content-Type",
 		"application/json",
 	)
 
-	json.NewEncoder(w).Encode(data)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		log.Printf("[ERROR] Failed to encode JSON response: %v", err)
+	}
 }
 
 func jsonErr(
@@ -414,14 +790,29 @@ func jsonErr(
 	message string,
 	status int,
 ) {
-	http.Error(w, message, status)
+	w.Header().Set(
+		"Content-Type",
+		"application/json",
+	)
+
+	w.WriteHeader(status)
+
+	_ = json.NewEncoder(w).Encode(
+		map[string]string{
+			"error": message,
+		},
+	)
 }
 
-// hashPassword derives a bcrypt hash. The previous implementation was a bare
-// unsalted SHA-256, which is fast enough to brute-force a leaked hash offline
-// and identical for identical passwords across accounts.
+// ================= PASSWORDS =================
+
+// hashPassword uses bcrypt instead of the old fast SHA-256 scheme.
 func hashPassword(password string) (string, error) {
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	hash, err := bcrypt.GenerateFromPassword(
+		[]byte(password),
+		bcrypt.DefaultCost,
+	)
+
 	if err != nil {
 		return "", err
 	}
@@ -429,8 +820,8 @@ func hashPassword(password string) (string, error) {
 	return string(hash), nil
 }
 
-// legacySHA256 reproduces the old hash so existing users.json files still
-// authenticate; see verifyPassword.
+// legacySHA256 exists only so old accounts can be migrated if they still
+// contain a legacy SHA-256 password hash.
 func legacySHA256(password string) string {
 	sum := sha256.Sum256([]byte(password))
 	return hex.EncodeToString(sum[:])
@@ -445,9 +836,15 @@ func isLegacyHash(stored string) bool {
 	return err == nil
 }
 
-// verifyPassword checks a password against either hash format. It reports
-// whether the stored hash is the old format and should be upgraded.
-func verifyPassword(stored, supplied string) (ok bool, needsUpgrade bool) {
+// verifyPassword supports both the old SHA-256 format and bcrypt.
+//
+// If needsUpgrade is true, the caller should replace the legacy hash
+// with a bcrypt hash after successful authentication.
+func verifyPassword(
+	stored string,
+	supplied string,
+) (ok bool, needsUpgrade bool) {
+
 	if isLegacyHash(stored) {
 		match := subtle.ConstantTimeCompare(
 			[]byte(legacySHA256(supplied)),
@@ -457,27 +854,48 @@ func verifyPassword(stored, supplied string) (ok bool, needsUpgrade bool) {
 		return match, match
 	}
 
-	err := bcrypt.CompareHashAndPassword([]byte(stored), []byte(supplied))
+	err := bcrypt.CompareHashAndPassword(
+		[]byte(stored),
+		[]byte(supplied),
+	)
+
 	return err == nil, false
 }
 
-// newID returns an unguessable identifier. The old version used a timestamp,
-// which is predictable and collides when two accounts are created in the same
-// nanosecond tick.
+// ================= IDs =================
+
 func newID() (string, error) {
 	buf := make([]byte, 16)
 
 	if _, err := rand.Read(buf); err != nil {
-		return "", fmt.Errorf("failed to generate id: %w", err)
+		return "", fmt.Errorf(
+			"failed to generate id: %w",
+			err,
+		)
 	}
 
 	return hex.EncodeToString(buf), nil
 }
 
+// ================= DATABASE HELPERS =================
+
+// isDuplicateError detects the MySQL duplicate-key error without
+// coupling the rest of the application to a driver-specific type.
+func isDuplicateError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	message := strings.ToLower(err.Error())
+
+	return strings.Contains(message, "duplicate entry") ||
+		strings.Contains(message, "duplicate key") ||
+		strings.Contains(message, "1062")
+}
+
 // ================= ACCESS ROUTER =================
 
 func handleSecretAccess(w http.ResponseWriter, r *http.Request) {
-
 	switch r.Method {
 
 	case http.MethodGet:
@@ -500,14 +918,35 @@ func handleSecretAccess(w http.ResponseWriter, r *http.Request) {
 func registerAPIs(mux *http.ServeMux) {
 
 	// Users
-	mux.HandleFunc("/api/users", handleAPIUsers)
-	mux.HandleFunc("/api/users/create", handleCreateUser)
-	mux.HandleFunc("/api/users/status", handleUserStatus)
-	mux.HandleFunc("/api/users/delete", handleDeleteUser)
+	mux.HandleFunc(
+		"/api/users",
+		handleAPIUsers,
+	)
+
+	mux.HandleFunc(
+		"/api/users/create",
+		handleCreateUser,
+	)
+
+	mux.HandleFunc(
+		"/api/users/status",
+		handleUserStatus,
+	)
+
+	mux.HandleFunc(
+		"/api/users/delete",
+		handleDeleteUser,
+	)
 
 	// Secrets
-	mux.HandleFunc("/api/secrets", handleAPISecrets)
+	mux.HandleFunc(
+		"/api/secrets",
+		handleAPISecrets,
+	)
 
-	// Sharing
-	mux.HandleFunc("/api/secrets/access", handleSecretAccess)
+	// Secret sharing
+	mux.HandleFunc(
+		"/api/secrets/access",
+		handleSecretAccess,
+	)
 }

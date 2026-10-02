@@ -1160,9 +1160,15 @@
 
 </div>
 
-
-```html
 <script>
+          const params = new URLSearchParams(window.location.search);
+
+      if (params.get("error") === "admin_required") {
+          alert("Admin access required");
+
+          // Remove ?error=admin_required from URL
+          history.replaceState({}, "", window.location.pathname);
+      }
 
     /* =========================
        LOGOUT

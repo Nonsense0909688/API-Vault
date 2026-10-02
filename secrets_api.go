@@ -1,16 +1,18 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"log"
 	"net/http"
 )
 
-// Handles saving new API keys.
+// ---------------------------------------------------------
+// SAVE / UPDATE SECRET
+// ---------------------------------------------------------
 
 func handleSaveSecretKey(w http.ResponseWriter, r *http.Request) {
-
 	user, ok := requireUser(w, r)
 	if !ok {
 		return
@@ -33,12 +35,8 @@ func handleSaveSecretKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Saving under a key someone else owns silently replaced their secret.
-	if !canAdministerSecret(user, data.Key) {
-		logEvent("ACCESS_DENIED", "User "+user.Username+" tried to overwrite "+data.Key)
-		http.Error(w, "A secret with that name belongs to another user", http.StatusForbidden)
-		return
-	}
+	// Always assign ownership from the logged-in user.
+	data.CreatedBy = user.ID
 
 	encryptedValue, err := encrypt(
 		encryptionKey,
@@ -52,49 +50,103 @@ func handleSaveSecretKey(w http.ResponseWriter, r *http.Request) {
 			err,
 		)
 
-		http.Error(w, "Failed to encrypt secret", 500)
+		http.Error(
+			w,
+			"Failed to encrypt secret",
+			http.StatusInternalServerError,
+		)
 		return
 	}
 
-	data.Value = hex.EncodeToString(encryptedValue)
-	data.CreatedBy = user.ID
+	encryptedHex := hex.EncodeToString(encryptedValue)
 
-	secretsMu.Lock()
-	defer secretsMu.Unlock()
+	// Check whether THIS USER already has a secret
+	// with this key.
+	var existingID int64
 
-	// Override existing secret
-	for i := range secrets {
+	err = db.QueryRow(`
+		SELECT id
+		FROM secrets
+		WHERE secret_key = ?
+		AND created_by = ?
+		LIMIT 1
+	`, data.Key, user.ID).Scan(&existingID)
 
-		if secrets[i].Key == data.Key {
+	if err == nil {
+		// Existing secret -> update it.
+		_, err = db.Exec(`
+			UPDATE secrets
+			SET secret_value = ?
+			WHERE id = ?
+			AND created_by = ?
+		`,
+			encryptedHex,
+			existingID,
+			user.ID,
+		)
 
-			// Keep original creator
-			if secrets[i].CreatedBy != "" {
-				data.CreatedBy = secrets[i].CreatedBy
-			}
+		if err != nil {
+			log.Printf(
+				"[ERROR] Failed to update secret '%s': %v",
+				data.Key,
+				err,
+			)
 
-			previous := secrets[i]
-			secrets[i] = data
-
-			if err := saveSecretsLocked(); err != nil {
-				secrets[i] = previous
-				http.Error(w, "Failed to save secret", 500)
-				return
-			}
-
-			jsonOut(w, map[string]string{
-				"status": "overridden",
-			})
-
+			http.Error(
+				w,
+				"Failed to save secret",
+				http.StatusInternalServerError,
+			)
 			return
 		}
+
+		jsonOut(w, map[string]string{
+			"status": "overridden",
+		})
+
+		return
 	}
 
-	// Create new secret
-	secrets = append(secrets, data)
+	if err != sql.ErrNoRows {
+		log.Printf(
+			"[ERROR] Failed to check existing secret: %v",
+			err,
+		)
 
-	if err := saveSecretsLocked(); err != nil {
-		secrets = secrets[:len(secrets)-1]
-		http.Error(w, "Failed to save secret", 500)
+		http.Error(
+			w,
+			"Database error",
+			http.StatusInternalServerError,
+		)
+		return
+	}
+
+	// New secret.
+	_, err = db.Exec(`
+		INSERT INTO secrets (
+			secret_key,
+			secret_value,
+			created_by
+		)
+		VALUES (?, ?, ?)
+	`,
+		data.Key,
+		encryptedHex,
+		user.ID,
+	)
+
+	if err != nil {
+		log.Printf(
+			"[ERROR] Failed to insert secret '%s': %v",
+			data.Key,
+			err,
+		)
+
+		http.Error(
+			w,
+			"Failed to save secret",
+			http.StatusInternalServerError,
+		)
 		return
 	}
 
@@ -103,100 +155,251 @@ func handleSaveSecretKey(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Handles viewing API keys so that one user cannot see another's.
-// The admin can see all the api keys and modify them.
+// ---------------------------------------------------------
+// VIEW SECRETS
+// ---------------------------------------------------------
 
 func handleViewSecrets(w http.ResponseWriter, r *http.Request) {
-
 	currentUser, ok := requireUser(w, r)
 	if !ok {
 		return
 	}
 
-	// Permissions file is optional.
-	// If it doesn't exist, loadJSON returns an empty list.
-	permissions, err := loadJSON[Permission](permissionsFile)
+	admin := isAdmin(currentUser)
+
+	var rows *sql.Rows
+	var err error
+
+	if admin {
+		// Admin sees everything.
+		rows, err = db.Query(`
+			SELECT
+				id,
+				secret_key,
+				secret_value,
+				created_by
+			FROM secrets
+			ORDER BY id DESC
+		`)
+	} else {
+		// Normal users see:
+		// 1. Their own secrets
+		// 2. Secrets explicitly shared with them
+		rows, err = db.Query(`
+			SELECT DISTINCT
+				s.id,
+				s.secret_key,
+				s.secret_value,
+				s.created_by
+			FROM secrets s
+			LEFT JOIN secret_permissions p
+				ON s.id = p.secret_id
+			WHERE s.created_by = ?
+			   OR p.user_id = ?
+			ORDER BY s.id DESC
+		`,
+			currentUser.ID,
+			currentUser.ID,
+		)
+	}
 
 	if err != nil {
-		log.Printf("[ERROR] Failed to load permissions: %v", err)
-		http.Error(w, "Failed to load permissions", 500)
+		log.Printf(
+			"[ERROR] Failed to query secrets: %v",
+			err,
+		)
+
+		http.Error(
+			w,
+			"Failed to load secrets",
+			http.StatusInternalServerError,
+		)
 		return
 	}
 
-	// Build list of secrets explicitly shared with this user.
-	allowed := make(map[string]bool)
+	defer rows.Close()
 
-	for _, permission := range permissions {
+	result := make([]Secret, 0)
 
-		for _, id := range permission.UserIDs {
+	for rows.Next() {
+		var secret Secret
 
-			if id == currentUser.ID {
-				allowed[permission.Key] = true
-				break
-			}
-		}
-	}
-
-	admin := isAdmin(currentUser)
-
-	secretsMu.RLock()
-	defer secretsMu.RUnlock()
-
-	result := make([]Secret, 0, len(secrets))
-
-	for _, secret := range secrets {
-
-		// A user can see:
-		// 1. Their own secrets
-		// 2. Secrets explicitly shared with them
-		// An admin sees everything.
-		if !admin && secret.CreatedBy != currentUser.ID && !allowed[secret.Key] {
-			continue
-		}
-
-		encryptedValue, err := hex.DecodeString(secret.Value)
-
-		if err != nil {
+		if err := rows.Scan(
+			&secret.ID,
+			&secret.Key,
+			&secret.Value,
+			&secret.CreatedBy,
+		); err != nil {
 			log.Printf(
-				"[ERROR] Failed to decode secret '%s': %v",
-				secret.Key,
+				"[ERROR] Failed to scan secret: %v",
 				err,
 			)
 
-			http.Error(w, "Failed to decode secret", 500)
-			return
-		}
-
-		decryptedValue, err := decrypt(
-			encryptionKey,
-			encryptedValue,
-		)
-
-		if err != nil {
-			log.Printf(
-				"[ERROR] Failed to decrypt secret '%s': %v",
-				secret.Key,
-				err,
+			http.Error(
+				w,
+				"Failed to load secrets",
+				http.StatusInternalServerError,
 			)
-
-			http.Error(w, "Failed to decrypt secret", 500)
 			return
 		}
 
+		// secret.Value is already encrypted in the database.
+		// Send the encrypted value directly.
 		result = append(result, Secret{
+			ID:        secret.ID,
 			Key:       secret.Key,
-			Value:     decryptedValue,
+			Value:     secret.Value,
 			CreatedBy: secret.CreatedBy,
 		})
+	}
+
+	if err := rows.Err(); err != nil {
+		log.Printf(
+			"[ERROR] Secret query failed: %v",
+			err,
+		)
+
+		http.Error(
+			w,
+			"Failed to load secrets",
+			http.StatusInternalServerError,
+		)
+		return
 	}
 
 	jsonOut(w, result)
 }
 
-// Handles deleting the api keys.
+func handleSecretValue(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireUser(w, r)
+	if !ok {
+		return
+	}
+
+	secretID := r.URL.Query().Get("id")
+
+	if secretID == "" {
+		http.Error(w, "secret id is required", http.StatusBadRequest)
+		return
+	}
+
+	var (
+		id            int64
+		encryptedText string
+		createdBy     string
+	)
+
+	err := db.QueryRow(`
+		SELECT
+			id,
+			secret_value,
+			created_by
+		FROM secrets
+		WHERE id = ?
+		LIMIT 1
+	`, secretID).Scan(
+		&id,
+		&encryptedText,
+		&createdBy,
+	)
+
+	if err == sql.ErrNoRows {
+		http.Error(w, "Secret not found", http.StatusNotFound)
+		return
+	}
+
+	if err != nil {
+		log.Printf("[ERROR] Failed to load secret %s: %v", secretID, err)
+		http.Error(w, "Failed to load secret", http.StatusInternalServerError)
+		return
+	}
+
+	// Check ownership / sharing.
+	if !isAdmin(user) && createdBy != user.ID {
+		var exists bool
+
+		err := db.QueryRow(`
+			SELECT EXISTS(
+				SELECT 1
+				FROM secret_permissions
+				WHERE secret_id = ?
+				  AND user_id = ?
+			)
+		`, id, user.ID).Scan(&exists)
+
+		if err != nil {
+			log.Printf(
+				"[ERROR] Failed to check secret permission: %v",
+				err,
+			)
+
+			http.Error(
+				w,
+				"Failed to check permission",
+				http.StatusInternalServerError,
+			)
+			return
+		}
+
+		if !exists {
+			http.Error(
+				w,
+				"Forbidden",
+				http.StatusForbidden,
+			)
+			return
+		}
+	}
+
+	// Decode encrypted database value.
+	encryptedValue, err := hex.DecodeString(encryptedText)
+	if err != nil {
+		log.Printf(
+			"[ERROR] Failed to decode secret %d: %v",
+			id,
+			err,
+		)
+
+		http.Error(
+			w,
+			"Failed to decode secret",
+			http.StatusInternalServerError,
+		)
+		return
+	}
+
+	// Decrypt ONLY this secret.
+	value, err := decrypt(
+		encryptionKey,
+		encryptedValue,
+	)
+
+	if err != nil {
+		log.Printf(
+			"[ERROR] Failed to decrypt secret %d: %v",
+			id,
+			err,
+		)
+
+		http.Error(
+			w,
+			"Failed to decrypt secret",
+			http.StatusInternalServerError,
+		)
+		return
+	}
+
+	jsonOut(w, map[string]interface{}{
+		"id":    id,
+		"value": value,
+	})
+}
+
+// ---------------------------------------------------------
+// DELETE SECRET
+// ---------------------------------------------------------
 
 func handleDeleteSecret(w http.ResponseWriter, r *http.Request) {
-
 	user, ok := requireUser(w, r)
 	if !ok {
 		return
@@ -212,59 +415,108 @@ func handleDeleteSecret(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if data.Key == "" {
-		http.Error(w, "Secret key is required", http.StatusBadRequest)
+		http.Error(
+			w,
+			"Secret key is required",
+			http.StatusBadRequest,
+		)
 		return
 	}
 
-	if _, exists := secretOwner(data.Key); !exists {
-		http.Error(w, "Secret not found", http.StatusNotFound)
+	var secretID int64
+	var ownerID string
+
+	err := db.QueryRow(`
+		SELECT id, created_by
+		FROM secrets
+		WHERE secret_key = ?
+		AND created_by = ?
+		LIMIT 1
+	`,
+		data.Key,
+		user.ID,
+	).Scan(
+		&secretID,
+		&ownerID,
+	)
+
+	// Admin can delete another user's secret.
+	if err == sql.ErrNoRows && isAdmin(user) {
+
+		err = db.QueryRow(`
+			SELECT id, created_by
+			FROM secrets
+			WHERE secret_key = ?
+			LIMIT 1
+		`,
+			data.Key,
+		).Scan(
+			&secretID,
+			&ownerID,
+		)
+	}
+
+	if err == sql.ErrNoRows {
+		http.Error(
+			w,
+			"Secret not found",
+			http.StatusNotFound,
+		)
 		return
 	}
 
-	// Deletion only checked that the caller was logged in, so any account
-	// could wipe any other account's secrets.
-	if !canAdministerSecret(user, data.Key) {
-		logEvent("ACCESS_DENIED", "User "+user.Username+" tried to delete "+data.Key)
-		http.Error(w, "Not allowed to delete this secret", http.StatusForbidden)
+	if err != nil {
+		log.Printf(
+			"[ERROR] Failed to find secret: %v",
+			err,
+		)
+
+		http.Error(
+			w,
+			"Database error",
+			http.StatusInternalServerError,
+		)
 		return
 	}
 
-	secretsMu.Lock()
+	// Non-admins can only delete their own secret.
+	if !isAdmin(user) && ownerID != user.ID {
+		logEvent(
+			"ACCESS_DENIED",
+			"User "+user.Username+
+				" tried to delete "+data.Key,
+		)
 
-	removed := false
-	remaining := make([]Secret, 0, len(secrets))
-
-	for _, secret := range secrets {
-		if secret.Key == data.Key {
-			removed = true
-			continue
-		}
-
-		remaining = append(remaining, secret)
-	}
-
-	if !removed {
-		secretsMu.Unlock()
-		http.Error(w, "Secret not found", http.StatusNotFound)
+		http.Error(
+			w,
+			"Not allowed to delete this secret",
+			http.StatusForbidden,
+		)
 		return
 	}
 
-	previous := secrets
-	secrets = remaining
+	// Permissions are automatically deleted because
+	// secret_permissions uses ON DELETE CASCADE.
+	_, err = db.Exec(`
+		DELETE FROM secrets
+		WHERE id = ?
+	`,
+		secretID,
+	)
 
-	if err := saveSecretsLocked(); err != nil {
-		secrets = previous
-		secretsMu.Unlock()
-		http.Error(w, "Failed to save secrets", 500)
+	if err != nil {
+		log.Printf(
+			"[ERROR] Failed to delete secret '%s': %v",
+			data.Key,
+			err,
+		)
+
+		http.Error(
+			w,
+			"Failed to delete secret",
+			http.StatusInternalServerError,
+		)
 		return
-	}
-
-	secretsMu.Unlock()
-
-	// Drop the sharing entry too, so a later secret reusing the name does not
-	// inherit the old grants.
-	if err := removePermission(data.Key); err != nil {
-		log.Printf("[ERROR] Failed to clear permissions for '%s': %v", data.Key, err)
 	}
 
 	jsonOut(w, map[string]string{
@@ -272,35 +524,9 @@ func handleDeleteSecret(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func removePermission(key string) error {
-	permissionsMu.Lock()
-	defer permissionsMu.Unlock()
-
-	permissions, err := loadJSON[Permission](permissionsFile)
-	if err != nil {
-		return err
-	}
-
-	remaining := make([]Permission, 0, len(permissions))
-	changed := false
-
-	for _, permission := range permissions {
-		if permission.Key == key {
-			changed = true
-			continue
-		}
-
-		remaining = append(remaining, permission)
-	}
-
-	if !changed {
-		return nil
-	}
-
-	return saveJSON(permissionsFile, remaining)
-}
-
-// Switching between saving, deleting and viewing keys.
+// ---------------------------------------------------------
+// API ROUTER
+// ---------------------------------------------------------
 
 func handleAPISecrets(w http.ResponseWriter, r *http.Request) {
 

@@ -14,10 +14,6 @@ import (
 //go:embed templates
 var templatesFS embed.FS
 
-// html/template, not text/template: the templates interpolate values into
-// HTML and into JavaScript string literals, and only html/template escapes
-// per context. With text/template a username containing a quote or a <script>
-// tag was injected verbatim into the page.
 var templates = template.Must(
 	template.ParseFS(templatesFS, "templates/*.html"),
 )
@@ -35,79 +31,106 @@ func main() {
 		"API-Vault v1.0.0",
 	)
 
+	// ---------------------------------------------------------
+	// CONFIG
+	// ---------------------------------------------------------
+
 	if err := loadConfig(); err != nil {
 		log.Fatal(err)
 	}
 
 	if generatedPasswordNotice != "" {
-		log.Printf("[SETUP] Created %s with a generated admin password: %s", configFile, generatedPasswordNotice)
-		log.Printf("[SETUP] Log in as %q with that password and change it.", config.Auth.AdminUsername)
+		log.Printf(
+			"[SETUP] Created %s with a generated admin password: %s",
+			configFile,
+			generatedPasswordNotice,
+		)
+
+		log.Printf(
+			"[SETUP] Log in as %q with that password and change it.",
+			config.Auth.AdminUsername,
+		)
 	}
 
-	initStorage()
 	initSessionDuration()
+
+	// ---------------------------------------------------------
+	// ENCRYPTION
+	// ---------------------------------------------------------
 
 	if err := loadEncryptionKey(); err != nil {
 		log.Fatal(err)
 	}
 
-	// Load secrets
-	if err := loadSecrets(); err != nil {
+	// ---------------------------------------------------------
+	// DATABASE
+	// ---------------------------------------------------------
 
+	if err := initDB(); err != nil {
 		log.Fatalf(
-			"[ERROR] Failed to load secrets: %v",
+			"[ERROR] Failed to initialize MySQL: %v",
 			err,
 		)
 	}
 
-	secretsMu.RLock()
-	secretCount := len(secrets)
-	secretsMu.RUnlock()
+	defer db.Close()
 
-	log.Printf(
-		"[STORAGE] Loaded %d secrets",
-		secretCount,
-	)
+	log.Println("[DB] MySQL initialized successfully")
 
-	// Load sessions
-	loaded, err := loadSessions()
+	// ---------------------------------------------------------
+	// ADMIN
+	// ---------------------------------------------------------
 
-	if err != nil {
-
-		log.Fatalf(
-			"[ERROR] Failed to load sessions: %v",
-			err,
-		)
-	}
-
-	sessionsMu.Lock()
-	sessions = loaded
-	sessionCount := len(sessions)
-	sessionsMu.Unlock()
-
-	log.Printf(
-		"[STORAGE] Loaded %d sessions",
-		sessionCount,
-	)
-
-	// The admin account is created at startup rather than on the first login
-	// request, so an unauthenticated caller cannot trigger the write.
+	// Create the admin account at startup.
+	// This prevents an unauthenticated request from triggering
+	// account creation.
 	if err := ensureAdminAccount(); err != nil {
-		log.Fatalf("[ERROR] Failed to ensure admin account: %v", err)
+		log.Fatalf(
+			"[ERROR] Failed to ensure admin account: %v",
+			err,
+		)
 	}
 
-	// A dedicated mux instead of DefaultServeMux: nothing this process
-	// imports can register a route behind our back.
+	// ---------------------------------------------------------
+	// ROUTES
+	// ---------------------------------------------------------
+
 	mux := http.NewServeMux()
 
 	registerPages(mux)
 	registerAPIs(mux)
 
-	mux.HandleFunc("/save_secrets", handleSaveSecretKey)
-	mux.HandleFunc("/view_secrets", handleViewSecrets)
-	mux.HandleFunc("/remove_secrets", handleDeleteSecret)
-	mux.HandleFunc("/login/post", handleLoginPost)
-	mux.HandleFunc("/logout", handleLogout)
+	// Legacy / direct endpoints
+	mux.HandleFunc(
+		"/save_secrets",
+		handleSaveSecretKey,
+	)
+
+	mux.HandleFunc(
+		"/view_secrets",
+		handleViewSecrets,
+	)
+
+	mux.HandleFunc(
+		"/remove_secrets",
+		handleDeleteSecret,
+	)
+
+	mux.HandleFunc(
+		"/login/post",
+		handleLoginPost,
+	)
+
+	mux.HandleFunc(
+		"/logout",
+		handleLogout,
+	)
+
+	mux.HandleFunc("/api/secrets/value", handleSecretValue)
+
+	// ---------------------------------------------------------
+	// SERVER
+	// ---------------------------------------------------------
 
 	addr := net.JoinHostPort(
 		config.AppSettings.Address,
@@ -123,23 +146,29 @@ func main() {
 	)
 
 	if !config.Session.SecureCookies {
-		log.Printf("[WARN] session.secure_cookies is off; the session cookie will also be sent over plain HTTP. Turn it on when serving over TLS.")
+		log.Printf(
+			"[WARN] session.secure_cookies is off; " +
+				"the session cookie will also be sent over plain HTTP. " +
+				"Enable it when serving over TLS.",
+		)
 	}
 
 	server := &http.Server{
 		Addr:    addr,
 		Handler: mux,
 
-		// Bound how long a client can hold a connection open without
-		// finishing a request.
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 
-	if err := server.ListenAndServe(); err != nil {
+	logEvent(
+		"SERVER",
+		"API-Vault is ready",
+	)
 
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf(
 			"[ERROR] Server stopped: %v",
 			err,

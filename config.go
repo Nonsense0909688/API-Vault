@@ -12,8 +12,7 @@ import (
 
 const configFile = "config.yml"
 
-// generatedPasswordNotice is set when loadConfig creates a fresh config, so
-// main can print the generated admin password once the logger is up.
+// generatedPasswordNotice is set when loadConfig creates a fresh config.
 var generatedPasswordNotice string
 
 func randomPassword() (string, error) {
@@ -26,9 +25,6 @@ func randomPassword() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
-// defaultConfig builds the first-run config. The admin password is random
-// rather than a fixed "Admin": a secret store that ships with known
-// credentials is open to anyone who can reach the port.
 func defaultConfig() (string, string, error) {
 	password, err := randomPassword()
 	if err != nil {
@@ -44,17 +40,22 @@ auth:
   # Generated on first run. Change it after your first login.
   admin_password: %q
 
+database:
+  host: 127.0.0.1
+  port: 3306
+  username: apivault
+  password: "CHANGE_ME"
+  name: apivault
+
 storage:
   appfolder: "appdata"
-  # Path to the AES key. Leave empty to keep it at <appfolder>/encryption.key,
-  # which stores it beside the encrypted secrets. Point it somewhere else, or
-  # set API_VAULT_ENCRYPTION_KEY, to separate the two.
+  # Path to the AES encryption key.
+  # Leave empty to use <appfolder>/encryption.key
   key_file: ""
 
 session:
   duration: 24h
-  # Marks the session cookie Secure. Turn this on whenever the vault is
-  # reachable over HTTPS, including behind a TLS-terminating proxy.
+  # Enable when the vault is served over HTTPS.
   secure_cookies: false
 `, password), password, nil
 }
@@ -69,7 +70,8 @@ func loadConfig() error {
 			return genErr
 		}
 
-		// 0600: this file holds the admin password.
+		// 0600 because this file contains the admin password
+		// and database credentials.
 		if err := os.WriteFile(configFile, []byte(contents), 0600); err != nil {
 			showError(err)
 			return err
@@ -106,16 +108,36 @@ func validateConfig() error {
 	}
 
 	if config.Auth.AdminPassword == "" {
-		err := fmt.Errorf("auth.admin_password in %s is empty; set a password before starting", configFile)
+		err := fmt.Errorf(
+			"auth.admin_password in %s is empty; set a password before starting",
+			configFile,
+		)
 		showError(err)
 		return err
+	}
+
+	if config.Database.Host == "" {
+		config.Database.Host = "127.0.0.1"
+	}
+
+	if config.Database.Port == 0 {
+		config.Database.Port = 3306
+	}
+
+	if config.Database.Username == "" {
+		return fmt.Errorf("database.username in %s is empty", configFile)
+	}
+
+	if config.Database.Name == "" {
+		return fmt.Errorf("database.name in %s is empty", configFile)
 	}
 
 	if config.Auth.AdminPassword == "Admin" {
 		log.Printf(
 			"[WARN] auth.admin_password is still the old default %q. "+
 				"Anyone who can reach this port can log in as admin. Change it in %s.",
-			config.Auth.AdminPassword, configFile,
+			config.Auth.AdminPassword,
+			configFile,
 		)
 	}
 
@@ -129,21 +151,11 @@ func warnConfigPermissions() {
 	}
 
 	if mode := info.Mode().Perm(); mode&0077 != 0 {
-		log.Printf("[WARN] %s holds the admin password and is readable beyond its owner (mode %04o); tighten it to 0600.", configFile, mode)
-	}
-}
-
-func initStorage() {
-	folder := config.Storage.AppFolder
-	if folder == "" {
-		folder = "appdata"
-	}
-
-	// Previously this read a package-level var initialised before the config
-	// was parsed, so storage.appfolder was silently ignored.
-	setAppFolder(folder)
-
-	if err := os.MkdirAll(appfolder, 0700); err != nil {
-		log.Fatal(err)
+		log.Printf(
+			"[WARN] %s contains credentials and is readable beyond its owner "+
+				"(mode %04o); tighten it to 0600.",
+			configFile,
+			mode,
+		)
 	}
 }

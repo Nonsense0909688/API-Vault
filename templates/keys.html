@@ -1018,11 +1018,9 @@
 
           <span>User Management</span>
         </a>
-
       </div>
 
       <div class="sidebar-bottom">
-
         <a href="#" onclick="logout()" class="logout-link">
           <i class="bi bi-box-arrow-right"></i>
 
@@ -1237,130 +1235,180 @@
     </div>
 
     <script>
-let allKeys = [], shareUsers = [], currentShareKey = "";
+      const params = new URLSearchParams(window.location.search);
 
-async function logout() {
-    const r = await fetch("/logout", { method: "POST" });
-    if (r.ok) location.href = "/";
-    else alert("Failed to logout.");
-}
+      if (params.get("error") === "admin_required") {
+        alert("Admin access required");
 
-function openModal() {
-    document.getElementById("addModal").classList.add("show");
-}
+        // Remove ?error=admin_required from URL
+        history.replaceState({}, "", window.location.pathname);
+      }
 
-function closeModal() {
-    document.getElementById("addModal").classList.remove("show");
-}
+      let allKeys = [],
+        shareUsers = [],
+        currentShareKey = "",
+        currentShareSecretId = null;
 
-async function addAPI() {
-    const name = document.getElementById("add_name").value.trim();
-    const key = document.getElementById("add_key").value.trim();
 
-    if (!name || !key) {
-        alert("Please enter both a name and API key.");
+      
+      async function revealSecret(id, element) {
+
+    // Currently revealed → hide again
+    if (element.dataset.revealed === "true") {
+        element.type = "password";
+        element.value = element.dataset.encrypted;
+        element.dataset.revealed = "false";
         return;
     }
 
-    const r = await fetch("/save_secrets", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key: name, value: key })
-    });
-
-    if (!r.ok) {
-        alert("Failed to save API key.");
-        return;
-    }
-
-    document.getElementById("add_name").value = "";
-    document.getElementById("add_key").value = "";
-    closeModal();
-    loadKeys();
-    loadRecentApis();
-}
-
-async function deleteAPI(key) {
-    if (!confirm(`Delete "${key}"?`)) return;
-
-    const r = await fetch("/remove_secrets", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key })
-    });
-
-    if (!r.ok) {
-        alert("Failed to delete API key.");
-        return;
-    }
-
-    loadKeys();
-    loadRecentApis();
-}
-
-async function copyKey(value) {
     try {
-        await navigator.clipboard.writeText(value);
-    } catch {
-        const input = document.createElement("textarea");
-        input.value = value;
-        document.body.appendChild(input);
-        input.select();
-        document.execCommand("copy");
-        input.remove();
+        element.value = "Decrypting...";
+
+        const response = await fetch(
+            "/api/secrets/value?id=" + encodeURIComponent(id)
+        );
+
+        if (!response.ok) {
+            throw new Error(await response.text());
+        }
+
+        const data = await response.json();
+
+        // Show decrypted value
+        element.type = "text";
+        element.value = data.value;
+        element.dataset.revealed = "true";
+
+    } catch (err) {
+        element.value = "Failed to reveal";
+        console.error(err);
     }
 }
 
-function toggleKey(button) {
-    const input = button.closest(".key-value").querySelector("input");
-    const visible = input.type === "text";
+      async function logout() {
+        const r = await fetch("/logout", { method: "POST" });
+        if (r.ok) location.href = "/";
+        else alert("Failed to logout.");
+      }
 
-    input.type = visible ? "password" : "text";
-    button.innerHTML = visible
-        ? '<i class="bi bi-eye-slash-fill"></i>'
-        : '<i class="bi bi-eye-fill"></i>';
-}
+      function openModal() {
+        document.getElementById("addModal").classList.add("show");
+      }
 
-async function loadKeys() {
-    try {
-        const r = await fetch("/view_secrets", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ key: "Testing" })
+      function closeModal() {
+        document.getElementById("addModal").classList.remove("show");
+      }
+
+      async function addAPI() {
+        const name = document.getElementById("add_name").value.trim();
+        const key = document.getElementById("add_key").value.trim();
+
+        if (!name || !key) {
+          alert("Please enter both a name and API key.");
+          return;
+        }
+
+        const r = await fetch("/save_secrets", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ key: name, value: key }),
         });
 
-        if (!r.ok) throw new Error("Request failed");
+        if (!r.ok) {
+          alert("Failed to save API key.");
+          return;
+        }
 
-        allKeys = await r.json();
-        if (!Array.isArray(allKeys)) allKeys = [];
+        document.getElementById("add_name").value = "";
+        document.getElementById("add_key").value = "";
+        closeModal();
+        loadKeys();
+        loadRecentApis();
+      }
 
-        updateStats();
-        renderKeys(allKeys);
-    } catch (err) {
-        console.error(err);
-        document.getElementById("keysList").innerHTML = `
+      async function deleteAPI(key) {
+        if (!confirm(`Delete "${key}"?`)) return;
+
+        const r = await fetch("/remove_secrets", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ key }),
+        });
+
+        if (!r.ok) {
+          alert("Failed to delete API key.");
+          return;
+        }
+
+        loadKeys();
+        loadRecentApis();
+      }
+
+      async function copyKey(value) {
+        try {
+          await navigator.clipboard.writeText(value);
+        } catch {
+          const input = document.createElement("textarea");
+          input.value = value;
+          document.body.appendChild(input);
+          input.select();
+          document.execCommand("copy");
+          input.remove();
+        }
+      }
+
+      function toggleKey(button) {
+        const input = button.closest(".key-value").querySelector("input");
+        const visible = input.type === "text";
+
+        input.type = visible ? "password" : "text";
+        button.innerHTML = visible
+          ? '<i class="bi bi-eye-slash-fill"></i>'
+          : '<i class="bi bi-eye-fill"></i>';
+      }
+
+      async function loadKeys() {
+        try {
+          const r = await fetch("/view_secrets", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ key: "Testing" }),
+          });
+
+          if (!r.ok) throw new Error("Request failed");
+
+          allKeys = await r.json();
+          if (!Array.isArray(allKeys)) allKeys = [];
+
+          updateStats();
+          renderKeys(allKeys);
+        } catch (err) {
+          console.error(err);
+          document.getElementById("keysList").innerHTML = `
             <div class="empty">
                 <i class="bi bi-exclamation-circle"></i>
                 <strong>Failed to load API keys</strong>
                 <span>Check your server connection.</span>
             </div>`;
-    }
-}
+        }
+      }
 
-function renderKeys(keys) {
-    const container = document.getElementById("keysList");
+      function renderKeys(keys) {
+        const container = document.getElementById("keysList");
 
-    if (!keys.length) {
-        container.innerHTML = `
+        if (!keys.length) {
+          container.innerHTML = `
             <div class="empty">
                 <i class="bi bi-key"></i>
                 <strong>No API keys yet</strong>
                 <span>Add your first API key to get started.</span>
             </div>`;
-        return;
-    }
+          return;
+        }
 
-    container.innerHTML = keys.map(key => `
+        container.innerHTML = keys
+          .map(
+            (key) => `
         <div class="key-row" data-name="${escapeHTML(key.key)}">
             <div class="key-name">
                 <div class="key-icon">
@@ -1373,15 +1421,29 @@ function renderKeys(keys) {
             </div>
 
             <div class="key-value">
-                <input type="password" value="${escapeHTML(key.value)}" readonly>
-                <button class="icon-button" onclick="toggleKey(this)" title="Reveal">
-                    <i class="bi bi-eye-slash-fill"></i>
-                </button>
-                <button class="icon-button"
-                    onclick="copyKey('${escapeJS(key.value)}')" title="Copy">
-                    <i class="bi bi-clipboard"></i>
-                </button>
-            </div>
+    <input
+        type="password"
+        value="${escapeHTML(key.value)}"
+        readonly
+        data-encrypted="${escapeHTML(key.value)}"
+    >
+
+    <button
+        class="icon-button"
+        onclick="revealSecret(${key.id}, this.previousElementSibling)"
+        title="Reveal"
+    >
+        <i class="bi bi-eye-slash-fill"></i>
+    </button>
+
+    <button
+        class="icon-button"
+        onclick="copyKey('${escapeJS(key.value)}')"
+        title="Copy"
+    >
+        <i class="bi bi-clipboard"></i>
+    </button>
+</div>
 
             <div>
                 <span class="status">Active</span>
@@ -1389,7 +1451,7 @@ function renderKeys(keys) {
 
             <div class="actions">
                 <button class="icon-button"
-                    onclick="openShareModal('${escapeJS(key.key)}')"
+                    onclick="openShareModal(${key.id}, '${escapeJS(key.key)}')"
                     title="Manage access">
                     <i class="bi bi-share-fill"></i>
                 </button>
@@ -1401,119 +1463,122 @@ function renderKeys(keys) {
                 </button>
             </div>
         </div>
-    `).join("");
-}
+    `,
+          )
+          .join("");
+      }
 
-function updateStats() {
-    const count = allKeys.length;
+      function updateStats() {
+        const count = allKeys.length;
 
-    document.getElementById("totalKeys").textContent = count;
-    document.getElementById("activeKeys").textContent = count;
-}
+        document.getElementById("totalKeys").textContent = count;
+        document.getElementById("activeKeys").textContent = count;
+      }
 
-function filterKeys() {
-    const search = document.getElementById("searchInput").value.toLowerCase();
+      function filterKeys() {
+        const search = document
+          .getElementById("searchInput")
+          .value.toLowerCase();
 
-    document.querySelectorAll(".key-row").forEach(row => {
-        row.style.display =
-            row.dataset.name.toLowerCase().includes(search) ? "" : "none";
-    });
-}
+        document.querySelectorAll(".key-row").forEach((row) => {
+          row.style.display = row.dataset.name.toLowerCase().includes(search)
+            ? ""
+            : "none";
+        });
+      }
 
-function escapeHTML(value) {
-    return String(value)
-        .replaceAll("&", "&amp;")
-        .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;")
-        .replaceAll('"', "&quot;")
-        .replaceAll("'", "&#039;");
-}
+      function escapeHTML(value) {
+        return String(value)
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#039;");
+      }
 
-function escapeJS(value) {
-    return String(value)
-        .replaceAll("\\", "\\\\")
-        .replaceAll("'", "\\'")
-        .replaceAll("\n", "\\n")
-        .replaceAll("\r", "\\r");
-}
+      function escapeJS(value) {
+        return String(value)
+          .replaceAll("\\", "\\\\")
+          .replaceAll("'", "\\'")
+          .replaceAll("\n", "\\n")
+          .replaceAll("\r", "\\r");
+      }
 
-/* =========================
+      /* =========================
    SHARING
 ========================= */
 
-window.currentUsername = "{{.Username}}"
+      window.currentUsername = "{{.Username}}";
 
-async function openShareModal(key) {
-    currentShareKey = key;
+      async function openShareModal(id, key) {
+        currentShareSecretId = id;
+        currentShareKey = key;
 
-    document.getElementById("shareKeyName").textContent = key;
-    document.getElementById("shareModal").classList.add("show");
+        document.getElementById("shareKeyName").textContent = key;
+        document.getElementById("shareModal").classList.add("show");
 
-    document.getElementById("shareUserList").innerHTML =
-        `<div class="share-empty">Loading users...</div>`;
+        document.getElementById("shareUserList").innerHTML =
+          `<div class="share-empty">Loading users...</div>`;
 
-    try {
-        const [usersRes, accessRes] = await Promise.all([
+        try {
+          const [usersRes, accessRes] = await Promise.all([
             fetch("/api/users"),
-            fetch("/api/secrets/access?key=" + encodeURIComponent(key))
-        ]);
+            fetch("/api/secrets/access?secret_id=" + encodeURIComponent(id)),
+          ]);
 
-        if (!usersRes.ok || !accessRes.ok) {
+          if (!usersRes.ok || !accessRes.ok) {
             throw new Error("Failed to load users or permissions.");
-        }
+          }
 
-        let users = await usersRes.json();
-        const access = await accessRes.json();
+          let users = await usersRes.json();
+          const access = await accessRes.json();
 
-        /*
-         * Get the currently logged-in username.
-         * window.currentUsername must be set by your server/page.
-         */
-        const currentUsername = String(window.currentUsername || "")
+          /*
+           * Get the currently logged-in username.
+           * window.currentUsername must be set by your server/page.
+           */
+          const currentUsername = String(window.currentUsername || "")
             .trim()
             .toLowerCase();
 
-        /*
-         * REMOVE THE CURRENTLY LOGGED-IN USER
-         */
-        shareUsers = users.filter(user => {
+          /*
+           * REMOVE THE CURRENTLY LOGGED-IN USER
+           */
+          shareUsers = users.filter((user) => {
             const username = String(user.username || "")
-                .trim()
-                .toLowerCase();
+              .trim()
+              .toLowerCase();
 
             return username !== currentUsername;
-        });
+          });
 
-        console.log("Current user:", currentUsername);
-        console.log("Users available for sharing:", shareUsers);
+          console.log("Current user:", currentUsername);
+          console.log("Users available for sharing:", shareUsers);
 
-        renderShareUsers(
-            Array.isArray(access.user_ids)
-                ? access.user_ids
-                : []
-        );
+          renderShareUsers(
+            Array.isArray(access.user_ids) ? access.user_ids : [],
+          );
+        } catch (err) {
+          console.error(err);
 
-    } catch (err) {
-        console.error(err);
-
-        document.getElementById("shareUserList").innerHTML =
+          document.getElementById("shareUserList").innerHTML =
             `<div class="share-empty">
                 Failed to load users or permissions.
             </div>`;
-    }
-}
+        }
+      }
 
+      function renderShareUsers(selectedIds) {
+        const container = document.getElementById("shareUserList");
 
-function renderShareUsers(selectedIds) {
-    const container = document.getElementById("shareUserList");
+        if (!shareUsers.length) {
+          container.innerHTML = `<div class="share-empty">No users available.</div>`;
+          return;
+        }
 
-    if (!shareUsers.length) {
-        container.innerHTML =
-            `<div class="share-empty">No users available.</div>`;
-        return;
-    }
-
-    container.innerHTML = shareUsers.map(user => `
+        container.innerHTML = shareUsers
+          .map(
+            (user) => `
         <label class="share-user">
             <div class="share-user-info">
                 <div class="share-user-icon">
@@ -1533,81 +1598,87 @@ function renderShareUsers(selectedIds) {
                 value="${escapeHTML(user.id)}"
                 ${selectedIds.includes(user.id) ? "checked" : ""}>
         </label>
-    `).join("");
-}
+    `,
+          )
+          .join("");
+      }
 
-async function saveSharePermissions() {
-    if (!currentShareKey) return;
+      async function saveSharePermissions() {
+        if (!currentShareSecretId) return;
 
-    const userIds = [...document.querySelectorAll(
-        "#shareUserList input[type='checkbox']:checked"
-    )].map(input => input.value);
+        const userIds = [
+          ...document.querySelectorAll(
+            "#shareUserList input[type='checkbox']:checked",
+          ),
+        ].map((input) => input.value);
 
-    try {
-        const r = await fetch("/api/secrets/access", {
+        try {
+          const r = await fetch("/api/secrets/access", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-                key: currentShareKey,
-                user_ids: userIds
-            })
-        });
+              secret_id: currentShareSecretId,
+              user_ids: userIds,
+            }),
+          });
 
-        if (!r.ok) throw new Error(await r.text());
+          if (!r.ok) throw new Error(await r.text());
 
-        closeShareModal();
-    } catch (err) {
-        console.error(err);
-        alert("Failed to save API key access:\n\n" + err.message);
-    }
-}
+          closeShareModal();
+        } catch (err) {
+          console.error(err);
+          alert("Failed to save API key access:\n\n" + err.message);
+        }
+      }
 
-function closeShareModal() {
-    document.getElementById("shareModal").classList.remove("show");
-    currentShareKey = "";
-}
+      function closeShareModal() {
+        document.getElementById("shareModal").classList.remove("show");
+        currentShareKey = "";
+        currentShareSecretId = null;
+      }
 
-/* =========================
+      /* =========================
    RECENTLY ADDED
 ========================= */
 
-async function loadRecentApis() {
-    try {
-        const [secretsRes, usersRes] = await Promise.all([
+      async function loadRecentApis() {
+        try {
+          const [secretsRes, usersRes] = await Promise.all([
             fetch("/api/secrets"),
-            fetch("/api/users")
-        ]);
+            fetch("/api/users"),
+          ]);
 
-        if (!secretsRes.ok || !usersRes.ok) return;
+          if (!secretsRes.ok || !usersRes.ok) return;
 
-        const secrets = await secretsRes.json();
-        const users = await usersRes.json();
+          const secrets = await secretsRes.json();
+          const users = await usersRes.json();
 
-        const currentUser = users.find(
-            user => user.username === window.currentUsername
-        );
+          const currentUser = users.find(
+            (user) => user.username === window.currentUsername,
+          );
 
-        let recent = Array.isArray(secrets) ? secrets : [];
+          let recent = Array.isArray(secrets) ? secrets : [];
 
-        // Normal users only see APIs they created.
-        // Admins see APIs from everyone.
-        if (currentUser && currentUser.role !== "admin") {
-            recent = recent.filter(secret =>
-                (secret.CreatedBy || secret.created_by) === currentUser.id
+          // Normal users only see APIs they created.
+          // Admins see APIs from everyone.
+          if (currentUser && currentUser.role !== "admin") {
+            recent = recent.filter(
+              (secret) =>
+                (secret.CreatedBy || secret.created_by) === currentUser.id,
             );
-        }
+          }
 
-        // Newest first
-        recent = recent.slice().reverse();
+          // Newest first
+          recent = recent.slice().reverse();
 
-        const stat = document.getElementById("recentAddedCount");
-        const container = document.getElementById("recentApis");
+          const stat = document.getElementById("recentAddedCount");
+          const container = document.getElementById("recentApis");
 
-        if (!recent.length) {
+          if (!recent.length) {
             if (stat) stat.textContent = "—";
 
             if (container) {
-                container.innerHTML = `
+              container.innerHTML = `
                     <div class="recent-item">
                         <span>No APIs added yet</span>
                     </div>
@@ -1615,30 +1686,31 @@ async function loadRecentApis() {
             }
 
             return;
-        }
+          }
 
-        // Latest API
-        const latest = recent[0];
-        const name = latest.Key || latest.key || "Unnamed API";
+          // Latest API
+          const latest = recent[0];
+          const name = latest.Key || latest.key || "Unnamed API";
 
-        // Shorten long names
-        const shortName = name.length > 25
-            ? name.substring(0, 25) + "..."
-            : name;
+          // Shorten long names
+          const shortName =
+            name.length > 25 ? name.substring(0, 25) + "..." : name;
 
-        // Update "Recently Added" stat
-        if (stat) {
+          // Update "Recently Added" stat
+          if (stat) {
             stat.textContent = shortName;
             stat.title = name;
-        }
+          }
 
-        // Show latest APIs
-        if (container) {
+          // Show latest APIs
+          if (container) {
             const latestApis = recent.slice(0, 5);
 
-            container.innerHTML = latestApis.map(secret => {
+            container.innerHTML = latestApis
+              .map((secret) => {
                 const apiName = secret.Key || secret.key || "Unnamed API";
-                const displayName = apiName.length > 25
+                const displayName =
+                  apiName.length > 25
                     ? apiName.substring(0, 25) + "..."
                     : apiName;
 
@@ -1652,20 +1724,20 @@ async function loadRecentApis() {
                         </div>
                     </div>
                 `;
-            }).join("");
+              })
+              .join("");
+          }
+        } catch (err) {
+          console.error("Failed to load recent APIs:", err);
         }
+      }
 
-    } catch (err) {
-        console.error("Failed to load recent APIs:", err);
-    }
-}
-
-/* =========================
+      /* =========================
    START
 ========================= */
 
-loadKeys();
-loadRecentApis();
-</script>
+      loadKeys();
+      loadRecentApis();
+    </script>
   </body>
 </html>

@@ -1,12 +1,9 @@
 package main
 
-import (
-	"path/filepath"
-	"sync"
-	"time"
-)
+import "time"
 
 type Secret struct {
+	ID        int64  `json:"id"`
 	Key       string `json:"key"`
 	Value     string `json:"value"`
 	CreatedBy string `json:"created_by"`
@@ -20,24 +17,40 @@ type QueryKey struct {
 	Key string `json:"key"`
 }
 
-// Shared mutable state. Every handler runs on its own goroutine, so each of
-// these needs its lock held for the whole read-modify-write, not just the
-// individual map or slice access.
-var (
-	sessionsMu sync.RWMutex
-	sessions   = map[string]Session{}
+type APIUser struct {
+	ID       string `json:"id"`
+	Username string `json:"username"`
+	Email    string `json:"email"`
+	Password string `json:"password,omitempty"`
+	Role     string `json:"role"`
+	Status   string `json:"status"`
+}
 
-	secretsMu sync.RWMutex
-	secrets   = []Secret{}
+func (u APIUser) Public() APIUser {
+	u.Password = ""
+	return u
+}
 
-	// users.json and permissions.json are re-read on every request, so the
-	// lock has to span load+save to keep two concurrent writers from
-	// clobbering each other.
-	usersMu       sync.Mutex
-	permissionsMu sync.Mutex
-)
+func publicUsers(users []APIUser) []APIUser {
+	out := make([]APIUser, 0, len(users))
 
-var encryptionKey []byte
+	for _, u := range users {
+		out = append(out, u.Public())
+	}
+
+	return out
+}
+
+type Permission struct {
+	SecretID int64    `json:"secret_id"`
+	UserIDs  []string `json:"user_ids"`
+}
+
+type Session struct {
+	ID        string    `json:"id"`
+	UserID    string    `json:"user_id"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
 
 type Config struct {
 	AppSettings struct {
@@ -50,82 +63,26 @@ type Config struct {
 		AdminPassword string `yaml:"admin_password"`
 	} `yaml:"auth"`
 
+	Database struct {
+		Host     string `yaml:"host"`
+		Port     int    `yaml:"port"`
+		Username string `yaml:"username"`
+		Password string `yaml:"password"`
+		Name     string `yaml:"name"`
+	} `yaml:"database"`
+
 	Storage struct {
 		AppFolder string `yaml:"appfolder"`
-
-		// KeyFile moves the AES key off the data directory. When empty the
-		// key is kept at <appfolder>/encryption.key, which means it sits
-		// beside the ciphertext it protects.
-		KeyFile string `yaml:"key_file"`
+		KeyFile   string `yaml:"key_file"`
 	} `yaml:"storage"`
 
 	Session struct {
-		Duration string `yaml:"duration"`
-
-		// SecureCookies marks the session cookie Secure, which browsers only
-		// send back over HTTPS. Leave it off for plain-HTTP local use; turn it
-		// on whenever the vault is reachable over TLS or sits behind a proxy
-		// that terminates it.
-		SecureCookies bool `yaml:"secure_cookies"`
+		Duration      string `yaml:"duration"`
+		SecureCookies bool   `yaml:"secure_cookies"`
 	} `yaml:"session"`
 }
 
-var config Config
-
-type APIUser struct {
-	ID       string `json:"id"`
-	Username string `json:"username"`
-	Email    string `json:"email"`
-	Password string `json:"password,omitempty"`
-	Role     string `json:"role"`
-	Status   string `json:"status"`
-}
-
-// Public returns a copy without the password hash, for anything that leaves
-// the process. APIUser itself keeps the field because it is what gets
-// persisted to users.json.
-func (u APIUser) Public() APIUser {
-	u.Password = ""
-	return u
-}
-
-func publicUsers(users []APIUser) []APIUser {
-	out := make([]APIUser, 0, len(users))
-	for _, u := range users {
-		out = append(out, u.Public())
-	}
-	return out
-}
-
-type Permission struct {
-	Key     string   `json:"key"`
-	UserIDs []string `json:"user_ids"`
-}
-
-// Set by initStorage once the config has actually been read. They cannot be
-// initialised here: package-level vars run before loadConfig, so anything
-// derived from config at this point is always the zero value.
 var (
-	appfolder       string
-	usersFile       string
-	permissionsFile string
-	sessions_file   string
-	secrets_file    string
+	config        Config
+	encryptionKey []byte
 )
-
-type Session struct {
-	UserID    string    `json:"user_id"`
-	ExpiresAt time.Time `json:"expires_at"`
-}
-
-func init() {
-	setAppFolder("appdata")
-}
-
-func setAppFolder(folder string) {
-	appfolder = folder
-	usersFile = filepath.Join(appfolder, "users.json")
-	permissionsFile = filepath.Join(appfolder, "permissions.json")
-	sessions_file = filepath.Join(appfolder, "sessions.json")
-	secrets_file = filepath.Join(appfolder, "secrets.json")
-}
